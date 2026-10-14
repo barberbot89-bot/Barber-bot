@@ -21,6 +21,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     MenuButtonWebApp,
+    CallbackQuery,
     Message,
     ReplyKeyboardMarkup,
     Update,
@@ -43,7 +44,7 @@ WEBAPP_URL = os.environ.get("WEBAPP_URL", "")  # Netlify mini app URL
 BASE_URL = (os.environ.get("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET") or hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:32]
 TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Tashkent"))
-SLOT_STEP = int(os.environ.get("SLOT_STEP_MIN", "30"))
+SLOT_STEP = int(os.environ.get("SLOT_STEP_MIN", "15"))
 MAX_ACTIVE_BOOKINGS = int(os.environ.get("MAX_ACTIVE_BOOKINGS", "3"))
 CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ORIGINS", "*").split(",")]
 
@@ -80,6 +81,26 @@ MSG = {
         "staff_cancelled": "❌ Отменено: {name} — {svc}, {branch}, {when}",
     },
 }
+
+
+MSG["uz"].update({
+    "pending_client": "⏳ Usta tasdig'ini kutyapmiz\n\n✂️ Usta: {barber}\n📅 {when}\n\nXizmatlar ({n}):\n{svcs}",
+    "confirmed": "✅ Yozuv tasdiqlandi!\n\n✂️ Usta: {barber}\n📅 {when}\n\nXizmatlar ({n}):\n{svcs}\n\n📍 Filial: {branch}\n🏠 {addr}{map}",
+    "client_cancelled": "❌ Yozuv bekor qilindi\n\n{barber} ustaga {when} sanasidagi yozuv bekor qilindi.",
+    "cancelled_by_staff": "❌ {when} dagi yozuvingiz usta tomonidan bekor qilindi.\nIltimos, boshqa vaqtga yozilishga urinib ko'ring.",
+    "staff_new": "🆕 Yangi yozuv — tasdiqlash kerak\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}{phone}",
+    "staff_cancelled": "❌ Mijoz bekor qildi: {name} — {svc}, {barber}, {when}",
+    "btn_cancel": "❌ Bekor qilish", "btn_ok": "✅ Tasdiqlash", "btn_no": "❌ Rad etish",
+})
+MSG["ru"].update({
+    "pending_client": "⏳ Ждём подтверждения мастера\n\n✂️ Мастер: {barber}\n📅 {when}\n\nУслуги ({n}):\n{svcs}",
+    "confirmed": "✅ Запись подтверждена!\n\n✂️ Мастер: {barber}\n📅 {when}\n\nУслуги ({n}):\n{svcs}\n\n📍 Филиал: {branch}\n🏠 {addr}{map}",
+    "client_cancelled": "❌ Запись отменена\n\nЗапись к мастеру {barber} на {when} отменена.",
+    "cancelled_by_staff": "❌ Мастер отменил вашу запись на {when}.\nПожалуйста, попробуйте записаться на другое время.",
+    "staff_new": "🆕 Новая запись — нужно подтвердить\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}{phone}",
+    "staff_cancelled": "❌ Клиент отменил: {name} — {svc}, {barber}, {when}",
+    "btn_cancel": "❌ Отменить", "btn_ok": "✅ Подтвердить", "btn_no": "❌ Отклонить",
+})
 
 
 def tr(lang: Optional[str], key: str, **kw) -> str:
@@ -119,6 +140,9 @@ class DB:
     async def update(self, table, filters, data):
         return await self._req("PATCH", table, params=filters, body=data)
 
+    async def delete(self, table, filters):
+        return await self._req("DELETE", table, params=filters)
+
     async def close(self):
         await self.c.aclose()
 
@@ -141,20 +165,24 @@ def fmt_dt(dt: datetime) -> str:
     return dt.astimezone(TZ).strftime("%d.%m %H:%M")
 
 
-async def notify(chat_id: int, text: str):
+async def notify(chat_id: int, text: str, markup=None):
     try:
-        await bot.send_message(chat_id, text)
+        return await bot.send_message(chat_id, text, reply_markup=markup)
     except Exception:
         log.warning("notify failed for %s", chat_id)
+
+
+def kb(*rows):
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=d) for t, d in r] for r in rows])
 
 
 async def staff_users() -> list[dict]:
     return await db.select("users", {"role": "in.(owner,admin)", "select": "telegram_id,lang"})
 
 
-async def notify_staff(key: str, **kw):
+async def notify_staff(key: str, markup_fn=None, **kw):
     for s in await staff_users():
-        await notify(s["telegram_id"], tr(s.get("lang"), key, **kw))
+        await notify(s["telegram_id"], tr(s.get("lang"), key, **kw), markup_fn(s.get("lang")) if markup_fn else None)
 
 
 async def ensure_user(tid: int, name: str, lang_hint: Optional[str] = None) -> dict:
@@ -192,6 +220,14 @@ def shop_out(r: dict) -> dict:
         "lat": r.get("lat"), "lng": r.get("lng"),
         "logo_url": img_url("/api/img/logo", r.get("logo_ver") or 0),
     }
+
+
+BARBER_COLS = "id,branch_id,name,active,photo_ver"
+
+
+def barber_out(r: dict, min_price=None) -> dict:
+    return {"id": r["id"], "branch_id": r["branch_id"], "name": r["name"], "active": r.get("active", True),
+            "min_price": min_price, "photo_url": img_url(f"/api/img/barber/{r['id']}", r.get("photo_ver") or 0)}
 
 
 def check_coords(data: dict):
@@ -276,38 +312,68 @@ async def get_branch(bid: int, active_only: bool = True) -> dict:
     return rows[0]
 
 
-async def compute_slots(d: date, service: dict, branch_id: int) -> list[str]:
+async def barber_parts(barber_id: int, ids_csv: str):
+    try:
+        ids = sorted({int(x) for x in ids_csv.split(",") if x})
+    except ValueError:
+        raise HTTPException(404, "not_found")
+    bar = await db.select("barbers", {"id": f"eq.{barber_id}", "active": "eq.true"})
+    if not bar or not ids:
+        raise HTTPException(404, "not_found")
+    svcs = await db.select("services", {"id": f"in.({','.join(map(str, ids))})", "active": "eq.true", "barber_id": f"eq.{barber_id}"})
+    if len(svcs) != len(ids):
+        raise HTTPException(404, "not_found")
+    return bar[0], svcs
+
+
+async def compute_slots(d: date, dur_min: int, branch_id: int, barber_id: int) -> dict:
+    empty = {"open": None, "close": None, "slots": []}
+    off = await db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"eq.{d.isoformat()}"})
     wh = await db.select("work_hours", {"branch_id": f"eq.{branch_id}", "weekday": f"eq.{d.weekday()}"})
-    if not wh or wh[0]["is_off"] or not wh[0]["start_time"] or not wh[0]["end_time"]:
-        return []
+    if off or not wh or wh[0]["is_off"] or not wh[0]["start_time"] or not wh[0]["end_time"]:
+        return empty
     st = dtime.fromisoformat(wh[0]["start_time"])
     en = dtime.fromisoformat(wh[0]["end_time"])
     day_start = datetime.combine(d, st, TZ)
     day_end = datetime.combine(d, en, TZ)
-    dur = timedelta(minutes=service["duration_min"])
-
+    dur = timedelta(minutes=dur_min)
     booked = await db.select("bookings", [
-        ("branch_id", f"eq.{branch_id}"),
-        ("status", "eq.booked"),
-        ("start_at", f"lt.{day_end.isoformat()}"),
-        ("end_at", f"gt.{day_start.isoformat()}"),
+        ("barber_id", f"eq.{barber_id}"), ("status", "in.(pending,booked)"),
+        ("start_at", f"lt.{day_end.isoformat()}"), ("end_at", f"gt.{day_start.isoformat()}"),
     ])
     busy = [(pdt(b["start_at"]), pdt(b["end_at"])) for b in booked]
-
     earliest = datetime.now(TZ) + timedelta(minutes=30)
     out, cur = [], day_start
     while cur + dur <= day_end:
         if cur >= earliest and all(not (cur < be and cur + dur > bs) for bs, be in busy):
             out.append(cur.isoformat())
         cur += timedelta(minutes=SLOT_STEP)
-    return out
+    return {"open": st.strftime("%H:%M"), "close": en.strftime("%H:%M"), "slots": out}
 
 
 # ---------------------------------------------------------------- models
 class BookingIn(BaseModel):
-    branch_id: int
-    service_id: int
+    barber_id: int
+    service_ids: list[int]
     start_at: str
+    phone: Optional[str] = None
+
+
+class BarberIn(BaseModel):
+    branch_id: int
+    name: str
+
+
+class BarberPatch(BaseModel):
+    branch_id: Optional[int] = None
+    name: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class DayOffIn(BaseModel):
+    barber_id: int
+    day: str
+    off: bool = True
 
 
 class LangIn(BaseModel):
@@ -319,6 +385,7 @@ class StatusIn(BaseModel):
 
 
 class ServiceIn(BaseModel):
+    barber_id: Optional[int] = None
     name: str
     price: int
     duration_min: int
@@ -411,6 +478,60 @@ async def on_contact(m: Message):
     await m.answer(tr(lang, "phone_saved"), reply_markup=main_keyboard(lang))
 
 
+# ---------------------------------------------------------------- booking status flow
+def map_link(b: dict) -> str:
+    br = b.get("branches") or {}
+    return f"\n🗺 https://www.google.com/maps/search/?api=1&query={br['lat']},{br['lng']}" if br.get("lat") is not None and br.get("lng") is not None else ""
+
+
+async def transition(bid: int, new: str, actor: dict) -> dict:
+    rows = await db.select("bookings", [("id", f"eq.{bid}"),
+                           ("select", "*,barbers(name),branches(name,address,lat,lng),users(name,lang)")])
+    if not rows:
+        raise HTTPException(404, "not_found")
+    b = rows[0]
+    staff = actor["role"] in ("owner", "admin")
+    if not staff and b["client_id"] != actor["telegram_id"]:
+        raise HTTPException(403, "forbidden")
+    if new == "booked" and (not staff or b["status"] != "pending"):
+        raise HTTPException(400, "cannot_cancel")
+    if new == "cancelled":
+        if b["status"] not in ("pending", "booked"):
+            raise HTTPException(400, "cannot_cancel")
+        if not staff and pdt(b["start_at"]) < datetime.now(timezone.utc):
+            raise HTTPException(400, "too_late")
+    out = (await db.update("bookings", {"id": f"eq.{bid}"}, {"status": new}))[0]
+    lang, when = (b["users"] or {}).get("lang"), fmt_dt(pdt(b["start_at"]))
+    barber = (b.get("barbers") or {}).get("name", "")
+    names = (b.get("svc_names") or "").split(", ")
+    if new == "booked":
+        svcs = "\n".join("• " + n for n in names)
+        await notify(b["client_id"], tr(lang, "confirmed", barber=barber, when=when, n=len(names), svcs=svcs,
+                     branch=b["branches"]["name"], addr=b["branches"].get("address") or "", map=map_link(b)))
+    elif b["client_id"] == actor["telegram_id"]:
+        await notify(b["client_id"], tr(lang, "client_cancelled", barber=barber, when=when))
+        await notify_staff("staff_cancelled", name=b["users"]["name"], svc=b.get("svc_names") or "", barber=barber, when=when)
+    else:
+        await notify(b["client_id"], tr(lang, "cancelled_by_staff", when=when))
+    return out
+
+
+@dp.callback_query(F.data.regexp(r"^(c|ok|no):\d+$"))
+async def on_booking_cb(cq: CallbackQuery):
+    kind, bid = cq.data.split(":")
+    u = await ensure_user(cq.from_user.id, cq.from_user.full_name, cq.from_user.language_code)
+    try:
+        await transition(int(bid), "booked" if kind == "ok" else "cancelled", u)
+    except HTTPException as e:
+        await cq.answer(str(e.detail), show_alert=True)
+        return
+    await cq.answer("✅")
+    try:
+        await cq.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------- reminders
 async def reminder_loop():
     while True:
@@ -427,7 +548,7 @@ async def reminder_loop():
                 await notify(r["client_id"], tr(
                     (r.get("users") or {}).get("lang"), "reminder",
                     t=pdt(r["start_at"]).astimezone(TZ).strftime("%H:%M"),
-                    svc=r["services"]["name"], branch=(r.get("branches") or {}).get("name", ""),
+                    svc=r.get("svc_names") or r["services"]["name"], branch=(r.get("branches") or {}).get("name", ""),
                 ))
                 await db.update("bookings", {"id": f"eq.{r['id']}"}, {"reminded": True})
         except Exception:
@@ -493,16 +614,22 @@ async def img_branch(bid: int):
 # ---------------------------------------------------------------- client API
 @app.get("/api/bootstrap")
 async def bootstrap(u: dict = Depends(get_user)):
-    shop, branches, services = await asyncio.gather(
+    shop, branches, services, barbers = await asyncio.gather(
         db.select("shop", {"id": "eq.1", "select": SHOP_COLS}),
         db.select("branches", {"active": "eq.true", "order": "id.asc", "select": BRANCH_COLS}),
         db.select("services", {"active": "eq.true", "order": "id.asc"}),
+        db.select("barbers", {"active": "eq.true", "order": "id.asc", "select": BARBER_COLS}),
     )
+    mins = {}
+    for sv in services:
+        if sv.get("barber_id"):
+            mins[sv["barber_id"]] = min(mins.get(sv["barber_id"], sv["price"]), sv["price"])
     return {
         "me": {"id": u["telegram_id"], "name": u["name"], "role": u["role"],
                "phone": u.get("phone"), "lang": u.get("lang") or "uz"},
         "shop": shop_out(shop[0]) if shop else shop_out({"name": "Barbershop"}),
         "branches": [branch_out(b) for b in branches],
+        "barbers": [barber_out(b, mins.get(b["id"])) for b in barbers],
         "services": services,
     }
 
@@ -520,24 +647,33 @@ async def services(u: dict = Depends(get_user)):
     return await db.select("services", {"active": "eq.true", "order": "id.asc"})
 
 
+@app.get("/api/barber-off")
+async def barber_off(barber_id: int, u: dict = Depends(get_user)):
+    bar = await db.select("barbers", {"id": f"eq.{barber_id}"})
+    if not bar:
+        raise HTTPException(404, "not_found")
+    wh = await db.select("work_hours", {"branch_id": f"eq.{bar[0]['branch_id']}", "is_off": "eq.true"})
+    days = await db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"gte.{datetime.now(TZ).date().isoformat()}"})
+    return {"weekdays": [w["weekday"] for w in wh], "days": [d["day"] for d in days]}
+
+
 @app.get("/api/slots")
-async def slots(date_: str, service_id: int, branch_id: int, u: dict = Depends(get_user)):
+async def slots(date_: str, barber_id: int, service_ids: str, u: dict = Depends(get_user)):
     try:
         d = date.fromisoformat(date_)
     except ValueError:
         raise HTTPException(400, "bad_date")
     today = datetime.now(TZ).date()
     if d < today or d > today + timedelta(days=30):
-        return []
-    svc = await get_service(service_id)
-    await get_branch(branch_id)
-    return await compute_slots(d, svc, branch_id)
+        return {"open": None, "close": None, "slots": []}
+    bar, svcs = await barber_parts(barber_id, service_ids)
+    return await compute_slots(d, sum(x["duration_min"] for x in svcs), bar["branch_id"], bar["id"])
 
 
 @app.post("/api/bookings")
 async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
-    svc = await get_service(b.service_id)
-    br = await get_branch(b.branch_id)
+    bar, svcs = await barber_parts(b.barber_id, ",".join(map(str, b.service_ids)))
+    br = await get_branch(bar["branch_id"])
     try:
         start = datetime.fromisoformat(b.start_at)
     except ValueError:
@@ -545,76 +681,65 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
     if start.tzinfo is None:
         start = start.replace(tzinfo=TZ)
     start = start.astimezone(TZ)
-
-    free = [datetime.fromisoformat(s) for s in await compute_slots(start.date(), svc, br["id"])]
+    dur = sum(x["duration_min"] for x in svcs)
+    free = [datetime.fromisoformat(x) for x in (await compute_slots(start.date(), dur, br["id"], bar["id"]))["slots"]]
     if start not in free:
         raise HTTPException(409, "slot_unavailable")
-
     active = await db.select("bookings", [
-        ("client_id", f"eq.{u['telegram_id']}"), ("status", "eq.booked"),
+        ("client_id", f"eq.{u['telegram_id']}"), ("status", "in.(pending,booked)"),
         ("start_at", f"gt.{now_utc_iso()}"), ("select", "id"),
     ])
     if len(active) >= MAX_ACTIVE_BOOKINGS:
         raise HTTPException(400, "too_many")
-
-    end = start + timedelta(minutes=svc["duration_min"])
+    phone = (b.phone or "").strip()[:32] or u.get("phone")
+    if phone and phone != u.get("phone"):
+        await db.update("users", {"telegram_id": f"eq.{u['telegram_id']}"}, {"phone": phone})
+    names = ", ".join(x["name"] for x in svcs)
     try:
         rows = await db.insert("bookings", {
-            "client_id": u["telegram_id"], "service_id": svc["id"], "branch_id": br["id"],
-            "start_at": start.isoformat(), "end_at": end.isoformat(),
+            "client_id": u["telegram_id"], "service_id": svcs[0]["id"], "service_ids": [x["id"] for x in svcs],
+            "barber_id": bar["id"], "branch_id": br["id"], "status": "pending", "svc_names": names,
+            "total_price": sum(x["price"] for x in svcs), "total_min": dur,
+            "start_at": start.isoformat(), "end_at": (start + timedelta(minutes=dur)).isoformat(),
             "reminded": (start - datetime.now(TZ)) <= timedelta(hours=2),
         })
     except DBError as e:
-        if "23P01" in e.body:  # exclusion constraint: slot taken at the same moment
+        if "23P01" in e.body:
             raise HTTPException(409, "slot_taken")
         raise
-
-    await notify_staff(
-        "staff_new", name=u["name"], svc=svc["name"], branch=br["name"], when=fmt_dt(start),
-        phone=(f"\n📞 {u['phone']}" if u.get("phone") else ""),
-    )
-    return rows[0]
+    bk = rows[0]
+    when, lang = fmt_dt(start), u.get("lang")
+    await notify(u["telegram_id"], tr(lang, "pending_client", barber=bar["name"], when=when, n=len(svcs),
+                 svcs="\n".join("• " + x["name"] for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")]))
+    await notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
+                       name=u["name"], svc=names, barber=bar["name"], branch=br["name"], when=when,
+                       phone=(f"\n📞 {phone}" if phone else ""))
+    return bk
 
 
 @app.get("/api/my-bookings")
 async def my_bookings(scope: str = "active", u: dict = Depends(get_user)):
-    params = [
-        ("client_id", f"eq.{u['telegram_id']}"),
-        ("select", "*,services(name,price),branches(name,address,lat,lng)"),
-    ]
+    params = [("client_id", f"eq.{u['telegram_id']}"), ("select", "*,barbers(name),branches(name,address,lat,lng)")]
     now_iso = now_utc_iso()
     if scope == "history":
-        params += [("or", f"(status.neq.booked,end_at.lte.{now_iso})"),
+        params += [("or", f"(status.in.(cancelled,done,no_show),end_at.lte.{now_iso})"),
                    ("order", "start_at.desc"), ("limit", "50")]
     else:
-        params += [("status", "eq.booked"), ("end_at", f"gt.{now_iso}"), ("order", "start_at.asc")]
+        params += [("status", "in.(pending,booked)"), ("end_at", f"gt.{now_iso}"), ("order", "start_at.asc")]
     return await db.select("bookings", params)
 
 
 @app.post("/api/bookings/{bid}/cancel")
 async def cancel_booking(bid: int, u: dict = Depends(get_user)):
-    rows = await db.select("bookings", [
-        ("id", f"eq.{bid}"), ("select", "*,services(name),branches(name),users(name,lang)"),
-    ])
-    if not rows:
-        raise HTTPException(404, "not_found")
-    b = rows[0]
-    staff = u["role"] in ("owner", "admin")
-    if b["client_id"] != u["telegram_id"] and not staff:
-        raise HTTPException(403, "forbidden")
-    if b["status"] != "booked":
-        raise HTTPException(400, "cannot_cancel")
-    if not staff and pdt(b["start_at"]) < datetime.now(timezone.utc):
-        raise HTTPException(400, "too_late")
-
-    await db.update("bookings", {"id": f"eq.{bid}"}, {"status": "cancelled"})
-    when = fmt_dt(pdt(b["start_at"]))
-    if b["client_id"] == u["telegram_id"]:
-        await notify_staff("staff_cancelled", name=b["users"]["name"], svc=b["services"]["name"],
-                           branch=b["branches"]["name"], when=when)
-    else:
-        await notify(b["client_id"], tr(b["users"].get("lang"), "cancelled_by_staff", when=when))
+    await transition(bid, "cancelled", u)
     return {"ok": True}
+
+
+# ---- barbers (public photo + admin)
+@app.get("/api/img/barber/{bid}")
+async def img_barber(bid: int):
+    rows = await db.select("barbers", {"id": f"eq.{bid}", "select": "photo_data"})
+    return image_response(rows[0]["photo_data"] if rows else None)
 
 
 # ---------------------------------------------------------------- admin API
@@ -628,7 +753,7 @@ async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(admin
     e = s + timedelta(days=1)
     params = [
         ("start_at", f"gte.{s.isoformat()}"), ("start_at", f"lt.{e.isoformat()}"),
-        ("order", "start_at.asc"), ("select", "*,services(name,price),users(name,phone),branches(name)"),
+        ("order", "start_at.asc"), ("select", "*,barbers(name),users(name,phone),branches(name)"),
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
@@ -637,15 +762,13 @@ async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(admin
 
 @app.post("/api/admin/bookings/{bid}/status")
 async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(admin_user)):
-    if body.status not in ("done", "no_show", "cancelled"):
+    if body.status in ("booked", "cancelled"):
+        return await transition(bid, body.status, a)
+    if body.status not in ("done", "no_show"):
         raise HTTPException(400, "Noto'g'ri holat")
-    cur = await db.select("bookings", [("id", f"eq.{bid}"), ("select", "*,users(lang)")])
-    if not cur:
-        raise HTTPException(404, "Topilmadi")
     rows = await db.update("bookings", {"id": f"eq.{bid}"}, {"status": body.status})
-    if body.status == "cancelled" and cur[0]["status"] == "booked":
-        await notify(cur[0]["client_id"], tr((cur[0].get("users") or {}).get("lang"), "cancelled_by_staff",
-                                             when=fmt_dt(pdt(cur[0]["start_at"]))))
+    if not rows:
+        raise HTTPException(404, "Topilmadi")
     return rows[0]
 
 
@@ -660,7 +783,7 @@ async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depend
         end = start + timedelta(days=1)
     params = [
         ("start_at", f"gte.{start.isoformat()}"), ("start_at", f"lt.{end.isoformat()}"),
-        ("select", "status,services(name,price)"),
+        ("select", "status,total_price,svc_names"),
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
@@ -670,9 +793,9 @@ async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depend
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         if r["status"] == "done":
-            revenue += r["services"]["price"]
-            n = r["services"]["name"]
-            by_service[n] = by_service.get(n, 0) + 1
+            revenue += r["total_price"] or 0
+            for n in (r["svc_names"] or "").split(", "):
+                by_service[n] = by_service.get(n, 0) + 1
     top = sorted(by_service.items(), key=lambda x: -x[1])
     return {"period": period, "revenue": revenue, "counts": counts,
             "by_service": [{"name": n, "count": c} for n, c in top]}
@@ -794,6 +917,63 @@ async def admin_set_hours(branch_id: int, weekday: int, body: HoursIn, a: dict =
     if not rows:
         rows = await db.insert("work_hours", {"branch_id": branch_id, "weekday": weekday, **data})
     return rows[0]
+
+
+# ---- barbers admin + days off
+@app.get("/api/admin/barbers")
+async def admin_barbers(a: dict = Depends(admin_user)):
+    return [barber_out(r) for r in await db.select("barbers", {"order": "id.asc", "select": BARBER_COLS})]
+
+
+@app.post("/api/admin/barbers")
+async def admin_add_barber(body: BarberIn, a: dict = Depends(admin_user)):
+    if not body.name.strip():
+        raise HTTPException(400, "Ismni kiriting")
+    return barber_out((await db.insert("barbers", {"branch_id": body.branch_id, "name": body.name.strip()}))[0])
+
+
+@app.patch("/api/admin/barbers/{bid}")
+async def admin_edit_barber(bid: int, body: BarberPatch, a: dict = Depends(admin_user)):
+    data = body.model_dump(exclude_none=True)
+    if not data:
+        raise HTTPException(400, "O'zgartirish yo'q")
+    rows = await db.update("barbers", {"id": f"eq.{bid}"}, data)
+    if not rows:
+        raise HTTPException(404, "Topilmadi")
+    return barber_out(rows[0])
+
+
+@app.put("/api/admin/barbers/{bid}/photo")
+async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(admin_user)):
+    check_image(body.data)
+    cur = await db.select("barbers", {"id": f"eq.{bid}", "select": "photo_ver"})
+    if not cur:
+        raise HTTPException(404, "Topilmadi")
+    ver = (cur[0]["photo_ver"] or 0) + 1
+    await db.update("barbers", {"id": f"eq.{bid}"}, {"photo_data": body.data, "photo_ver": ver})
+    return {"photo_url": img_url(f"/api/img/barber/{bid}", ver)}
+
+
+@app.get("/api/admin/days-off")
+async def admin_days_off(barber_id: int, a: dict = Depends(admin_user)):
+    return await db.select("days_off", {"barber_id": f"eq.{barber_id}", "order": "day.asc"})
+
+
+@app.post("/api/admin/days-off")
+async def admin_set_day_off(body: DayOffIn, a: dict = Depends(admin_user)):
+    try:
+        day = date.fromisoformat(body.day).isoformat()
+    except ValueError:
+        raise HTTPException(400, "Sana noto'g'ri")
+    if body.off:
+        try:
+            await db.insert("days_off", {"barber_id": body.barber_id, "day": day})
+        except DBError as e:
+            if "23505" not in e.body:
+                raise
+    else:
+        await db.delete("days_off", {"barber_id": f"eq.{body.barber_id}", "day": f"eq.{day}"})
+    return {"ok": True}
 
 
 # ---- owner only: admins management
