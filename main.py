@@ -346,23 +346,31 @@ async def barber_parts(barber_id: int, ids_csv: str):
         ids = sorted({int(x) for x in ids_csv.split(",") if x})
     except ValueError:
         raise HTTPException(404, "not_found")
-    bar = await cached(f"bar:{barber_id}", 60, {"barbers"}, lambda: db.select("barbers", {"id": f"eq.{barber_id}", "active": "eq.true"}))
-    if not bar or not ids:
+    if not ids:
         raise HTTPException(404, "not_found")
-    svcs = await cached(f"svc:{barber_id}:{ids}", 60, {"services"}, lambda: db.select("services", {"id": f"in.({','.join(map(str, ids))})", "active": "eq.true", "barber_id": f"eq.{barber_id}"}))
-    if len(svcs) != len(ids):
+    bar, svcs = await asyncio.gather(
+        cached(f"bar:{barber_id}", 60, {"barbers"}, lambda: db.select("barbers", {"id": f"eq.{barber_id}", "active": "eq.true"})),
+        cached(f"svc:{barber_id}:{ids}", 60, {"services"}, lambda: db.select("services", {"id": f"in.({','.join(map(str, ids))})", "active": "eq.true", "barber_id": f"eq.{barber_id}"})),
+    )
+    if not bar or len(svcs) != len(ids):
         raise HTTPException(404, "not_found")
     return bar[0], svcs
 
 
-async def compute_slots(d: date, dur_min: int, branch_id: int, barber_id: int) -> dict:
+async def load_busy(barber_id: int, d: date, lo: datetime, fresh: bool):
+    def q():
+        return db.select("bookings", [("barber_id", f"eq.{barber_id}"), ("status", "in.(pending,booked)"),
+                                      ("start_at", f"lt.{(lo + timedelta(days=1)).isoformat()}"), ("end_at", f"gt.{lo.isoformat()}")])
+    return await q() if fresh else await cached(f"busy:{barber_id}:{d}", 30, {"bookings"}, q)
+
+
+async def compute_slots(d: date, dur_min: int, branch_id: int, barber_id: int, fresh: bool = False) -> dict:
     empty = {"open": None, "close": None, "slots": []}
     lo = datetime.combine(d, dtime.min, TZ)
     off, wh, booked = await asyncio.gather(
         cached(f"dayoff:{barber_id}:{d}", 30, {"days_off"}, lambda: db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"eq.{d.isoformat()}"})),
         cached(f"wh:{branch_id}:{d.weekday()}", 60, {"work_hours"}, lambda: db.select("work_hours", {"branch_id": f"eq.{branch_id}", "weekday": f"eq.{d.weekday()}"})),
-        db.select("bookings", [("barber_id", f"eq.{barber_id}"), ("status", "in.(pending,booked)"),
-                               ("start_at", f"lt.{(lo + timedelta(days=1)).isoformat()}"), ("end_at", f"gt.{lo.isoformat()}")]),
+        load_busy(barber_id, d, lo, fresh),
     )
     if off or not wh or wh[0]["is_off"] or not wh[0]["start_time"] or not wh[0]["end_time"]:
         return empty
@@ -720,7 +728,7 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
     start = start.astimezone(TZ)
     dur = sum(x["duration_min"] for x in svcs)
     slot_res, active = await asyncio.gather(
-        compute_slots(start.date(), dur, br["id"], bar["id"]),
+        compute_slots(start.date(), dur, br["id"], bar["id"], fresh=True),
         db.select("bookings", [("client_id", f"eq.{u['telegram_id']}"), ("status", "in.(pending,booked)"),
                                ("start_at", f"gt.{now_utc_iso()}"), ("select", "id")]))
     free = [datetime.fromisoformat(x) for x in slot_res["slots"]]
@@ -730,7 +738,7 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
         raise HTTPException(400, "too_many")
     phone = (b.phone or "").strip()[:32] or u.get("phone")
     if phone and phone != u.get("phone"):
-        await db.update("users", {"telegram_id": f"eq.{u['telegram_id']}"}, {"phone": phone})
+        bg(db.update("users", {"telegram_id": f"eq.{u['telegram_id']}"}, {"phone": phone}))
     names = ", ".join(x["name"] for x in svcs)
     try:
         rows = await db.insert("bookings", {
