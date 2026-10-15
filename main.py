@@ -386,7 +386,7 @@ async def compute_slots(d: date, dur_min: int, branch_id: int, barber_id: int, f
         if cur >= earliest and all(not (cur < be and cur + dur > bs) for bs, be in busy):
             out.append(cur.isoformat())
         cur += timedelta(minutes=SLOT_STEP)
-    return {"open": st.strftime("%H:%M"), "close": en.strftime("%H:%M"), "slots": out}
+    return {"open": st.strftime("%H:%M"), "close": en.strftime("%H:%M"), "slots": out, "step": SLOT_STEP}
 
 
 # ---------------------------------------------------------------- models
