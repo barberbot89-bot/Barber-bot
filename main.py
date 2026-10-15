@@ -1,4 +1,5 @@
 import asyncio
+import time as _time
 import base64
 import hashlib
 import hmac
@@ -115,12 +116,38 @@ class DBError(Exception):
         self.body = body
 
 
+_cache: dict = {}
+_bg: set = set()
+
+
+async def cached(key, ttl, tables, fn):
+    hit = _cache.get(key)
+    now = _time.monotonic()
+    if hit and hit[0] > now:
+        return hit[1]
+    val = await fn()
+    _cache[key] = (now + ttl, val, frozenset(tables))
+    return val
+
+
+def invalidate(table: str):
+    for k in [k for k, v in _cache.items() if table in v[2]]:
+        _cache.pop(k, None)
+
+
+def bg(coro):
+    t = asyncio.create_task(coro)
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
+
+
 class DB:
     def __init__(self, url: str, key: str):
         headers = {"apikey": key, "Content-Type": "application/json"}
         if not key.startswith("sb_"):  # legacy JWT keys also need Authorization
             headers["Authorization"] = f"Bearer {key}"
-        self.c = httpx.AsyncClient(base_url=f"{url}/rest/v1", headers=headers, timeout=20)
+        self.c = httpx.AsyncClient(base_url=f"{url}/rest/v1", headers=headers, timeout=20,
+                                   limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=60))
 
     async def _req(self, method, table, params=None, body=None):
         r = await self.c.request(
@@ -129,6 +156,8 @@ class DB:
         )
         if r.status_code >= 400:
             raise DBError(r.status_code, r.text)
+        if method != "GET":
+            invalidate(table)
         return r.json() if r.text else []
 
     async def select(self, table, params=None):
@@ -177,7 +206,7 @@ def kb(*rows):
 
 
 async def staff_users() -> list[dict]:
-    return await db.select("users", {"role": "in.(owner,admin)", "select": "telegram_id,lang"})
+    return await cached("staff", 60, {"users"}, lambda: db.select("users", {"role": "in.(owner,admin)", "select": "telegram_id,lang"}))
 
 
 async def notify_staff(key: str, markup_fn=None, **kw):
@@ -186,7 +215,7 @@ async def notify_staff(key: str, markup_fn=None, **kw):
 
 
 async def ensure_user(tid: int, name: str, lang_hint: Optional[str] = None) -> dict:
-    rows = await db.select("users", {"telegram_id": f"eq.{tid}"})
+    rows = await cached(f"user:{tid}", 60, {"users"}, lambda: db.select("users", {"telegram_id": f"eq.{tid}"}))
     if rows:
         u = rows[0]
     else:
@@ -306,7 +335,7 @@ async def get_service(sid: int, active_only: bool = True) -> dict:
 
 
 async def get_branch(bid: int, active_only: bool = True) -> dict:
-    rows = await db.select("branches", {"id": f"eq.{bid}", "select": BRANCH_COLS})
+    rows = await cached(f"branch:{bid}", 60, {"branches"}, lambda: db.select("branches", {"id": f"eq.{bid}", "select": BRANCH_COLS}))
     if not rows or (active_only and not rows[0]["active"]):
         raise HTTPException(404, "not_found")
     return rows[0]
@@ -317,10 +346,10 @@ async def barber_parts(barber_id: int, ids_csv: str):
         ids = sorted({int(x) for x in ids_csv.split(",") if x})
     except ValueError:
         raise HTTPException(404, "not_found")
-    bar = await db.select("barbers", {"id": f"eq.{barber_id}", "active": "eq.true"})
+    bar = await cached(f"bar:{barber_id}", 60, {"barbers"}, lambda: db.select("barbers", {"id": f"eq.{barber_id}", "active": "eq.true"}))
     if not bar or not ids:
         raise HTTPException(404, "not_found")
-    svcs = await db.select("services", {"id": f"in.({','.join(map(str, ids))})", "active": "eq.true", "barber_id": f"eq.{barber_id}"})
+    svcs = await cached(f"svc:{barber_id}:{ids}", 60, {"services"}, lambda: db.select("services", {"id": f"in.({','.join(map(str, ids))})", "active": "eq.true", "barber_id": f"eq.{barber_id}"}))
     if len(svcs) != len(ids):
         raise HTTPException(404, "not_found")
     return bar[0], svcs
@@ -328,8 +357,13 @@ async def barber_parts(barber_id: int, ids_csv: str):
 
 async def compute_slots(d: date, dur_min: int, branch_id: int, barber_id: int) -> dict:
     empty = {"open": None, "close": None, "slots": []}
-    off = await db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"eq.{d.isoformat()}"})
-    wh = await db.select("work_hours", {"branch_id": f"eq.{branch_id}", "weekday": f"eq.{d.weekday()}"})
+    lo = datetime.combine(d, dtime.min, TZ)
+    off, wh, booked = await asyncio.gather(
+        cached(f"dayoff:{barber_id}:{d}", 30, {"days_off"}, lambda: db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"eq.{d.isoformat()}"})),
+        cached(f"wh:{branch_id}:{d.weekday()}", 60, {"work_hours"}, lambda: db.select("work_hours", {"branch_id": f"eq.{branch_id}", "weekday": f"eq.{d.weekday()}"})),
+        db.select("bookings", [("barber_id", f"eq.{barber_id}"), ("status", "in.(pending,booked)"),
+                               ("start_at", f"lt.{(lo + timedelta(days=1)).isoformat()}"), ("end_at", f"gt.{lo.isoformat()}")]),
+    )
     if off or not wh or wh[0]["is_off"] or not wh[0]["start_time"] or not wh[0]["end_time"]:
         return empty
     st = dtime.fromisoformat(wh[0]["start_time"])
@@ -337,10 +371,6 @@ async def compute_slots(d: date, dur_min: int, branch_id: int, barber_id: int) -
     day_start = datetime.combine(d, st, TZ)
     day_end = datetime.combine(d, en, TZ)
     dur = timedelta(minutes=dur_min)
-    booked = await db.select("bookings", [
-        ("barber_id", f"eq.{barber_id}"), ("status", "in.(pending,booked)"),
-        ("start_at", f"lt.{day_end.isoformat()}"), ("end_at", f"gt.{day_start.isoformat()}"),
-    ])
     busy = [(pdt(b["start_at"]), pdt(b["end_at"])) for b in booked]
     earliest = datetime.now(TZ) + timedelta(minutes=30)
     out, cur = [], day_start
@@ -612,8 +642,7 @@ async def img_branch(bid: int):
 
 
 # ---------------------------------------------------------------- client API
-@app.get("/api/bootstrap")
-async def bootstrap(u: dict = Depends(get_user)):
+async def public_data():
     shop, branches, services, barbers = await asyncio.gather(
         db.select("shop", {"id": "eq.1", "select": SHOP_COLS}),
         db.select("branches", {"active": "eq.true", "order": "id.asc", "select": BRANCH_COLS}),
@@ -625,13 +654,18 @@ async def bootstrap(u: dict = Depends(get_user)):
         if sv.get("barber_id"):
             mins[sv["barber_id"]] = min(mins.get(sv["barber_id"], sv["price"]), sv["price"])
     return {
-        "me": {"id": u["telegram_id"], "name": u["name"], "role": u["role"],
-               "phone": u.get("phone"), "lang": u.get("lang") or "uz"},
         "shop": shop_out(shop[0]) if shop else shop_out({"name": "Barbershop"}),
         "branches": [branch_out(b) for b in branches],
         "barbers": [barber_out(b, mins.get(b["id"])) for b in barbers],
         "services": services,
     }
+
+
+@app.get("/api/bootstrap")
+async def bootstrap(u: dict = Depends(get_user)):
+    pub = await cached("public", 120, {"shop", "branches", "services", "barbers"}, public_data)
+    return {"me": {"id": u["telegram_id"], "name": u["name"], "role": u["role"],
+                   "phone": u.get("phone"), "lang": u.get("lang") or "uz"}, **pub}
 
 
 @app.post("/api/me/lang")
@@ -649,12 +683,15 @@ async def services(u: dict = Depends(get_user)):
 
 @app.get("/api/barber-off")
 async def barber_off(barber_id: int, u: dict = Depends(get_user)):
-    bar = await db.select("barbers", {"id": f"eq.{barber_id}"})
-    if not bar:
-        raise HTTPException(404, "not_found")
-    wh = await db.select("work_hours", {"branch_id": f"eq.{bar[0]['branch_id']}", "is_off": "eq.true"})
-    days = await db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"gte.{datetime.now(TZ).date().isoformat()}"})
-    return {"weekdays": [w["weekday"] for w in wh], "days": [d["day"] for d in days]}
+    async def load():
+        bar = await db.select("barbers", {"id": f"eq.{barber_id}"})
+        if not bar:
+            raise HTTPException(404, "not_found")
+        wh, days = await asyncio.gather(
+            db.select("work_hours", {"branch_id": f"eq.{bar[0]['branch_id']}", "is_off": "eq.true"}),
+            db.select("days_off", {"barber_id": f"eq.{barber_id}", "day": f"gte.{datetime.now(TZ).date().isoformat()}"}))
+        return {"weekdays": [w["weekday"] for w in wh], "days": [d["day"] for d in days]}
+    return await cached(f"off:{barber_id}:{datetime.now(TZ).date()}", 30, {"barbers", "work_hours", "days_off"}, load)
 
 
 @app.get("/api/slots")
@@ -682,13 +719,13 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
         start = start.replace(tzinfo=TZ)
     start = start.astimezone(TZ)
     dur = sum(x["duration_min"] for x in svcs)
-    free = [datetime.fromisoformat(x) for x in (await compute_slots(start.date(), dur, br["id"], bar["id"]))["slots"]]
+    slot_res, active = await asyncio.gather(
+        compute_slots(start.date(), dur, br["id"], bar["id"]),
+        db.select("bookings", [("client_id", f"eq.{u['telegram_id']}"), ("status", "in.(pending,booked)"),
+                               ("start_at", f"gt.{now_utc_iso()}"), ("select", "id")]))
+    free = [datetime.fromisoformat(x) for x in slot_res["slots"]]
     if start not in free:
         raise HTTPException(409, "slot_unavailable")
-    active = await db.select("bookings", [
-        ("client_id", f"eq.{u['telegram_id']}"), ("status", "in.(pending,booked)"),
-        ("start_at", f"gt.{now_utc_iso()}"), ("select", "id"),
-    ])
     if len(active) >= MAX_ACTIVE_BOOKINGS:
         raise HTTPException(400, "too_many")
     phone = (b.phone or "").strip()[:32] or u.get("phone")
@@ -709,11 +746,11 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
         raise
     bk = rows[0]
     when, lang = fmt_dt(start), u.get("lang")
-    await notify(u["telegram_id"], tr(lang, "pending_client", barber=bar["name"], when=when, n=len(svcs),
-                 svcs="\n".join("• " + x["name"] for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")]))
-    await notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
+    bg(notify(u["telegram_id"], tr(lang, "pending_client", barber=bar["name"], when=when, n=len(svcs),
+              svcs="\n".join("• " + x["name"] for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")])))
+    bg(notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
                        name=u["name"], svc=names, barber=bar["name"], branch=br["name"], when=when,
-                       phone=(f"\n📞 {phone}" if phone else ""))
+                       phone=(f"\n📞 {phone}" if phone else "")))
     return bk
 
 
