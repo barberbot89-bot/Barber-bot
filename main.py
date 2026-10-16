@@ -104,6 +104,10 @@ MSG["ru"].update({
 })
 
 
+def loc(row: dict, key: str, lang: Optional[str]) -> str:
+    return ((row.get(key + "_ru") if lang == "ru" else None) or row.get(key) or "")
+
+
 def tr(lang: Optional[str], key: str, **kw) -> str:
     return (MSG.get(lang or "uz") or MSG["uz"])[key].format(**kw)
 
@@ -211,7 +215,9 @@ async def staff_users() -> list[dict]:
 
 async def notify_staff(key: str, markup_fn=None, **kw):
     for s in await staff_users():
-        await notify(s["telegram_id"], tr(s.get("lang"), key, **kw), markup_fn(s.get("lang")) if markup_fn else None)
+        lg = s.get("lang")
+        k2 = {k: (((v[1] or v[0]) if lg == "ru" else v[0]) if isinstance(v, tuple) else v) for k, v in kw.items()}
+        await notify(s["telegram_id"], tr(lg, key, **k2), markup_fn(lg) if markup_fn else None)
 
 
 async def ensure_user(tid: int, name: str, lang_hint: Optional[str] = None) -> dict:
@@ -232,30 +238,30 @@ def img_url(path: str, ver: int) -> Optional[str]:
 
 def branch_out(r: dict) -> dict:
     return {
-        "id": r["id"], "name": r["name"], "address": r.get("address"),
+        "id": r["id"], "name": r["name"], "name_ru": r.get("name_ru"), "address": r.get("address"), "address_ru": r.get("address_ru"),
         "lat": r.get("lat"), "lng": r.get("lng"), "active": r.get("active", True),
         "photo_url": img_url(f"/api/img/branch/{r['id']}", r.get("photo_ver") or 0),
     }
 
 
-BRANCH_COLS = "id,name,address,lat,lng,active,photo_ver"
-SHOP_COLS = "name,logo_ver,desc_uz,desc_ru,address,phone,lat,lng"
+BRANCH_COLS = "id,name,name_ru,address,address_ru,lat,lng,active,photo_ver"
+SHOP_COLS = "name,name_ru,logo_ver,desc_uz,desc_ru,address,address_ru,phone,lat,lng"
 
 
 def shop_out(r: dict) -> dict:
     return {
-        "name": r["name"], "desc_uz": r.get("desc_uz"), "desc_ru": r.get("desc_ru"),
+        "name": r["name"], "name_ru": r.get("name_ru"), "address_ru": r.get("address_ru"), "desc_uz": r.get("desc_uz"), "desc_ru": r.get("desc_ru"),
         "address": r.get("address"), "phone": r.get("phone"),
         "lat": r.get("lat"), "lng": r.get("lng"),
         "logo_url": img_url("/api/img/logo", r.get("logo_ver") or 0),
     }
 
 
-BARBER_COLS = "id,branch_id,name,active,photo_ver"
+BARBER_COLS = "id,branch_id,name,name_ru,active,photo_ver"
 
 
 def barber_out(r: dict, min_price=None) -> dict:
-    return {"id": r["id"], "branch_id": r["branch_id"], "name": r["name"], "active": r.get("active", True),
+    return {"id": r["id"], "branch_id": r["branch_id"], "name": r["name"], "name_ru": r.get("name_ru"), "active": r.get("active", True),
             "min_price": min_price, "photo_url": img_url(f"/api/img/barber/{r['id']}", r.get("photo_ver") or 0)}
 
 
@@ -400,11 +406,13 @@ class BookingIn(BaseModel):
 class BarberIn(BaseModel):
     branch_id: int
     name: str
+    name_ru: Optional[str] = None
 
 
 class BarberPatch(BaseModel):
     branch_id: Optional[int] = None
     name: Optional[str] = None
+    name_ru: Optional[str] = None
     active: Optional[bool] = None
 
 
@@ -425,12 +433,14 @@ class StatusIn(BaseModel):
 class ServiceIn(BaseModel):
     barber_id: Optional[int] = None
     name: str
+    name_ru: Optional[str] = None
     price: int
     duration_min: int
 
 
 class ServicePatch(BaseModel):
     name: Optional[str] = None
+    name_ru: Optional[str] = None
     price: Optional[int] = None
     duration_min: Optional[int] = None
     active: Optional[bool] = None
@@ -444,6 +454,8 @@ class HoursIn(BaseModel):
 
 class BranchIn(BaseModel):
     name: str
+    name_ru: Optional[str] = None
+    address_ru: Optional[str] = None
     address: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
@@ -451,6 +463,8 @@ class BranchIn(BaseModel):
 
 class BranchPatch(BaseModel):
     name: Optional[str] = None
+    name_ru: Optional[str] = None
+    address_ru: Optional[str] = None
     address: Optional[str] = None
     lat: Optional[float] = None
     lng: Optional[float] = None
@@ -459,6 +473,8 @@ class BranchPatch(BaseModel):
 
 class ShopPatch(BaseModel):
     name: Optional[str] = None
+    name_ru: Optional[str] = None
+    address_ru: Optional[str] = None
     desc_uz: Optional[str] = None
     desc_ru: Optional[str] = None
     address: Optional[str] = None
@@ -524,7 +540,7 @@ def map_link(b: dict) -> str:
 
 async def transition(bid: int, new: str, actor: dict) -> dict:
     rows = await db.select("bookings", [("id", f"eq.{bid}"),
-                           ("select", "*,barbers(name),branches(name,address,lat,lng),users(name,lang)")])
+                           ("select", "*,barbers(name,name_ru),branches(name,name_ru,address,address_ru,lat,lng),users(name,lang)")])
     if not rows:
         raise HTTPException(404, "not_found")
     b = rows[0]
@@ -540,15 +556,16 @@ async def transition(bid: int, new: str, actor: dict) -> dict:
             raise HTTPException(400, "too_late")
     out = (await db.update("bookings", {"id": f"eq.{bid}"}, {"status": new}))[0]
     lang, when = (b["users"] or {}).get("lang"), fmt_dt(pdt(b["start_at"]))
-    barber = (b.get("barbers") or {}).get("name", "")
-    names = (b.get("svc_names") or "").split(", ")
+    barber = loc(b.get("barbers") or {}, "name", lang)
+    names = ((b.get("svc_names_ru") if lang == "ru" else None) or b.get("svc_names") or "").split(", ")
     if new == "booked":
         svcs = "\n".join("• " + n for n in names)
         await notify(b["client_id"], tr(lang, "confirmed", barber=barber, when=when, n=len(names), svcs=svcs,
-                     branch=b["branches"]["name"], addr=b["branches"].get("address") or "", map=map_link(b)))
+                     branch=loc(b["branches"], "name", lang), addr=loc(b["branches"], "address", lang), map=map_link(b)))
     elif b["client_id"] == actor["telegram_id"]:
         await notify(b["client_id"], tr(lang, "client_cancelled", barber=barber, when=when))
-        await notify_staff("staff_cancelled", name=b["users"]["name"], svc=b.get("svc_names") or "", barber=barber, when=when)
+        await notify_staff("staff_cancelled", name=b["users"]["name"], svc=(b.get("svc_names") or "", b.get("svc_names_ru") or b.get("svc_names") or ""),
+                           barber=(loc(b.get("barbers") or {}, "name", "uz"), loc(b.get("barbers") or {}, "name", "ru")), when=when)
     else:
         await notify(b["client_id"], tr(lang, "cancelled_by_staff", when=when))
     return out
@@ -580,13 +597,14 @@ async def reminder_loop():
                 ("reminded", "eq.false"),
                 ("start_at", f"gt.{now.isoformat()}"),
                 ("start_at", f"lte.{(now + timedelta(hours=2)).isoformat()}"),
-                ("select", "*,services(name),branches(name),users(lang)"),
+                ("select", "*,services(name),branches(name,name_ru),users(lang)"),
             ])
             for r in rows:
                 await notify(r["client_id"], tr(
                     (r.get("users") or {}).get("lang"), "reminder",
                     t=pdt(r["start_at"]).astimezone(TZ).strftime("%H:%M"),
-                    svc=r.get("svc_names") or r["services"]["name"], branch=(r.get("branches") or {}).get("name", ""),
+                    svc=((r.get("svc_names_ru") if (r.get("users") or {}).get("lang") == "ru" else None) or r.get("svc_names") or r["services"]["name"]),
+                    branch=loc(r.get("branches") or {}, "name", (r.get("users") or {}).get("lang")),
                 ))
                 await db.update("bookings", {"id": f"eq.{r['id']}"}, {"reminded": True})
         except Exception:
@@ -740,10 +758,11 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
     if phone and phone != u.get("phone"):
         bg(db.update("users", {"telegram_id": f"eq.{u['telegram_id']}"}, {"phone": phone}))
     names = ", ".join(x["name"] for x in svcs)
+    names_ru = ", ".join(loc(x, "name", "ru") for x in svcs)
     try:
         rows = await db.insert("bookings", {
             "client_id": u["telegram_id"], "service_id": svcs[0]["id"], "service_ids": [x["id"] for x in svcs],
-            "barber_id": bar["id"], "branch_id": br["id"], "status": "pending", "svc_names": names,
+            "barber_id": bar["id"], "branch_id": br["id"], "status": "pending", "svc_names": names, "svc_names_ru": names_ru,
             "total_price": sum(x["price"] for x in svcs), "total_min": dur,
             "start_at": start.isoformat(), "end_at": (start + timedelta(minutes=dur)).isoformat(),
             "reminded": (start - datetime.now(TZ)) <= timedelta(hours=2),
@@ -754,17 +773,17 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
         raise
     bk = rows[0]
     when, lang = fmt_dt(start), u.get("lang")
-    bg(notify(u["telegram_id"], tr(lang, "pending_client", barber=bar["name"], when=when, n=len(svcs),
-              svcs="\n".join("• " + x["name"] for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")])))
+    bg(notify(u["telegram_id"], tr(lang, "pending_client", barber=loc(bar, "name", lang), when=when, n=len(svcs),
+              svcs="\n".join("• " + loc(x, "name", lang) for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")])))
     bg(notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
-                       name=u["name"], svc=names, barber=bar["name"], branch=br["name"], when=when,
+                       name=u["name"], svc=(names, names_ru), barber=(bar["name"], loc(bar, "name", "ru")), branch=(br["name"], loc(br, "name", "ru")), when=when,
                        phone=(f"\n📞 {phone}" if phone else "")))
     return bk
 
 
 @app.get("/api/my-bookings")
 async def my_bookings(scope: str = "active", u: dict = Depends(get_user)):
-    params = [("client_id", f"eq.{u['telegram_id']}"), ("select", "*,barbers(name),branches(name,address,lat,lng)")]
+    params = [("client_id", f"eq.{u['telegram_id']}"), ("select", "*,barbers(name,name_ru),branches(name,name_ru,address,address_ru,lat,lng)")]
     now_iso = now_utc_iso()
     if scope == "history":
         params += [("or", f"(status.in.(cancelled,done,no_show),end_at.lte.{now_iso})"),
@@ -798,7 +817,7 @@ async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(admin
     e = s + timedelta(days=1)
     params = [
         ("start_at", f"gte.{s.isoformat()}"), ("start_at", f"lt.{e.isoformat()}"),
-        ("order", "start_at.asc"), ("select", "*,barbers(name),users(name,phone),branches(name)"),
+        ("order", "start_at.asc"), ("select", "*,barbers(name,name_ru),users(name,phone),branches(name,name_ru)"),
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
@@ -974,7 +993,7 @@ async def admin_barbers(a: dict = Depends(admin_user)):
 async def admin_add_barber(body: BarberIn, a: dict = Depends(admin_user)):
     if not body.name.strip():
         raise HTTPException(400, "Ismni kiriting")
-    return barber_out((await db.insert("barbers", {"branch_id": body.branch_id, "name": body.name.strip()}))[0])
+    return barber_out((await db.insert("barbers", {"branch_id": body.branch_id, "name": body.name.strip(), "name_ru": (body.name_ru or "").strip() or None}))[0])
 
 
 @app.patch("/api/admin/barbers/{bid}")
