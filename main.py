@@ -104,6 +104,26 @@ MSG["ru"].update({
 })
 
 
+MSG["uz"].update({
+    "client_cancelled": "❌ Siz yozuvni bekor qildingiz\n\n✂️ Usta: {barber}\n📅 {when}\n\nBekor qilingan xizmatlar ({n}):\n{svcs}",
+    "cancelled_by_staff": "❌ Yozuv usta tomonidan bekor qilindi\n\n✂️ Usta: {barber}\n📅 {when}\n\nBekor qilingan xizmatlar ({n}):\n{svcs}\n\nIltimos, boshqa vaqtga yozilishga urinib ko'ring.",
+})
+MSG["ru"].update({
+    "client_cancelled": "❌ Вы отменили запись\n\n✂️ Мастер: {barber}\n📅 {when}\n\nОтменённые услуги ({n}):\n{svcs}",
+    "cancelled_by_staff": "❌ Запись отменена мастером\n\n✂️ Мастер: {barber}\n📅 {when}\n\nОтменённые услуги ({n}):\n{svcs}\n\nПожалуйста, попробуйте записаться на другое время.",
+})
+
+
+async def edit_or_send(chat_id: int, msg_id, text: str):
+    if msg_id:
+        try:
+            await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id)
+            return
+        except Exception:
+            log.warning("edit failed for %s", chat_id)
+    await notify(chat_id, text)
+
+
 def loc(row: dict, key: str, lang: Optional[str]) -> str:
     return ((row.get(key + "_ru") if lang == "ru" else None) or row.get(key) or "")
 
@@ -558,16 +578,18 @@ async def transition(bid: int, new: str, actor: dict) -> dict:
     lang, when = (b["users"] or {}).get("lang"), fmt_dt(pdt(b["start_at"]))
     barber = loc(b.get("barbers") or {}, "name", lang)
     names = ((b.get("svc_names_ru") if lang == "ru" else None) or b.get("svc_names") or "").split(", ")
+    svcs = "\n".join("• " + n for n in names)
     if new == "booked":
-        svcs = "\n".join("• " + n for n in names)
-        await notify(b["client_id"], tr(lang, "confirmed", barber=barber, when=when, n=len(names), svcs=svcs,
-                     branch=loc(b["branches"], "name", lang), addr=loc(b["branches"], "address", lang), map=map_link(b)))
-    elif b["client_id"] == actor["telegram_id"]:
-        await notify(b["client_id"], tr(lang, "client_cancelled", barber=barber, when=when))
-        await notify_staff("staff_cancelled", name=b["users"]["name"], svc=(b.get("svc_names") or "", b.get("svc_names_ru") or b.get("svc_names") or ""),
-                           barber=(loc(b.get("barbers") or {}, "name", "uz"), loc(b.get("barbers") or {}, "name", "ru")), when=when)
+        await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "confirmed", barber=barber, when=when, n=len(names), svcs=svcs,
+                           branch=loc(b["branches"], "name", lang), addr=loc(b["branches"], "address", lang), map=map_link(b)))
     else:
-        await notify(b["client_id"], tr(lang, "cancelled_by_staff", when=when))
+        cancelled = "\n".join(f"• {n} - {when}" for n in names)
+        if b["client_id"] == actor["telegram_id"]:
+            await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "client_cancelled", barber=barber, when=when, n=len(names), svcs=cancelled))
+            await notify_staff("staff_cancelled", name=b["users"]["name"], svc=(b.get("svc_names") or "", b.get("svc_names_ru") or b.get("svc_names") or ""),
+                               barber=(loc(b.get("barbers") or {}, "name", "uz"), loc(b.get("barbers") or {}, "name", "ru")), when=when)
+        else:
+            await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "cancelled_by_staff", barber=barber, when=when, n=len(names), svcs=cancelled))
     return out
 
 
@@ -773,8 +795,12 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
         raise
     bk = rows[0]
     when, lang = fmt_dt(start), u.get("lang")
-    bg(notify(u["telegram_id"], tr(lang, "pending_client", barber=loc(bar, "name", lang), when=when, n=len(svcs),
-              svcs="\n".join("• " + loc(x, "name", lang) for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")])))
+    async def send_pending():
+        m = await notify(u["telegram_id"], tr(lang, "pending_client", barber=loc(bar, "name", lang), when=when, n=len(svcs),
+              svcs="\n".join("• " + loc(x, "name", lang) for x in svcs)), kb([(tr(lang, "btn_cancel"), f"c:{bk['id']}")]))
+        if m:
+            await db.update("bookings", {"id": f"eq.{bk['id']}"}, {"client_msg_id": m.message_id})
+    bg(send_pending())
     bg(notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
                        name=u["name"], svc=(names, names_ru), barber=(bar["name"], loc(bar, "name", "ru")), branch=(br["name"], loc(br, "name", "ru")), when=when,
                        phone=(f"\n📞 {phone}" if phone else "")))
