@@ -90,7 +90,7 @@ MSG["uz"].update({
     "client_cancelled": "❌ Yozuv bekor qilindi\n\n{barber} ustaga {when} sanasidagi yozuv bekor qilindi.",
     "cancelled_by_staff": "❌ {when} dagi yozuvingiz usta tomonidan bekor qilindi.\nIltimos, boshqa vaqtga yozilishga urinib ko'ring.",
     "staff_new": "🆕 Yangi yozuv — tasdiqlash kerak\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}{phone}",
-    "staff_cancelled": "❌ Mijoz bekor qildi: {name} — {svc}, {barber}, {when}",
+    "staff_cancelled": "❌ Mijoz o'zi bekor qildi: {name} — {svc}, {barber}, {when}",
     "btn_cancel": "❌ Bekor qilish", "btn_ok": "✅ Tasdiqlash", "btn_no": "❌ Rad etish",
 })
 MSG["ru"].update({
@@ -99,7 +99,7 @@ MSG["ru"].update({
     "client_cancelled": "❌ Запись отменена\n\nЗапись к мастеру {barber} на {when} отменена.",
     "cancelled_by_staff": "❌ Мастер отменил вашу запись на {when}.\nПожалуйста, попробуйте записаться на другое время.",
     "staff_new": "🆕 Новая запись — нужно подтвердить\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}{phone}",
-    "staff_cancelled": "❌ Клиент отменил: {name} — {svc}, {barber}, {when}",
+    "staff_cancelled": "❌ Клиент сам отменил: {name} — {svc}, {barber}, {when}",
     "btn_cancel": "❌ Отменить", "btn_ok": "✅ Подтвердить", "btn_no": "❌ Отклонить",
 })
 
@@ -233,11 +233,31 @@ async def staff_users() -> list[dict]:
     return await cached("staff", 60, {"users"}, lambda: db.select("users", {"role": "in.(owner,admin)", "select": "telegram_id,lang"}))
 
 
-async def notify_staff(key: str, markup_fn=None, **kw):
+def _kw_lang(kw: dict, lg) -> dict:
+    return {k: (((v[1] or v[0]) if lg == "ru" else v[0]) if isinstance(v, tuple) else v) for k, v in kw.items()}
+
+
+async def notify_staff(key: str, markup_fn=None, **kw) -> dict:
+    """Barcha adminlarga yuboradi. Qaytaradi: {chat_id(str): message_id}"""
+    sent = {}
     for s in await staff_users():
         lg = s.get("lang")
-        k2 = {k: (((v[1] or v[0]) if lg == "ru" else v[0]) if isinstance(v, tuple) else v) for k, v in kw.items()}
-        await notify(s["telegram_id"], tr(lg, key, **k2), markup_fn(lg) if markup_fn else None)
+        m = await notify(s["telegram_id"], tr(lg, key, **_kw_lang(kw, lg)), markup_fn(lg) if markup_fn else None)
+        if m:
+            sent[str(s["telegram_id"])] = m.message_id
+    return sent
+
+
+async def edit_staff_msgs(b: dict, key: str, **kw) -> bool:
+    """Bron uchun adminlarga yuborilgan xabarlarni tahrirlaydi (tugmalar ham o'chadi)."""
+    msgs = b.get("staff_msgs") or {}
+    if not msgs:
+        return False
+    langs = {str(s["telegram_id"]): s.get("lang") for s in await staff_users()}
+    for cid, mid in msgs.items():
+        lg = langs.get(cid)
+        await edit_or_send(int(cid), mid, tr(lg, key, **_kw_lang(kw, lg)))
+    return True
 
 
 async def ensure_user(tid: int, name: str, lang_hint: Optional[str] = None) -> dict:
@@ -586,8 +606,12 @@ async def transition(bid: int, new: str, actor: dict) -> dict:
         cancelled = "\n".join(f"• {n} - {when}" for n in names)
         if b["client_id"] == actor["telegram_id"]:
             await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "client_cancelled", barber=barber, when=when, n=len(names), svcs=cancelled))
-            await notify_staff("staff_cancelled", name=b["users"]["name"], svc=(b.get("svc_names") or "", b.get("svc_names_ru") or b.get("svc_names") or ""),
-                               barber=(loc(b.get("barbers") or {}, "name", "uz"), loc(b.get("barbers") or {}, "name", "ru")), when=when)
+            kw = dict(name=b["users"]["name"], svc=(b.get("svc_names") or "", b.get("svc_names_ru") or b.get("svc_names") or ""),
+                      barber=(loc(b.get("barbers") or {}, "name", "uz"), loc(b.get("barbers") or {}, "name", "ru")), when=when)
+            # tasdiqlanmagan bo'lsa -- eski xabarni almashtiramiz (yangi xabar yubormaymiz);
+            # tasdiqlangan bo'lsa -- admin bilishi uchun yangi xabar yuboramiz
+            if not (b["status"] == "pending" and await edit_staff_msgs(b, "staff_cancelled", **kw)):
+                await notify_staff("staff_cancelled", **kw)
         else:
             await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "cancelled_by_staff", barber=barber, when=when, n=len(names), svcs=cancelled))
     return out
@@ -801,9 +825,16 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
         if m:
             await db.update("bookings", {"id": f"eq.{bk['id']}"}, {"client_msg_id": m.message_id})
     bg(send_pending())
-    bg(notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
+    async def send_staff():
+        sent = await notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
                        name=u["name"], svc=(names, names_ru), barber=(bar["name"], loc(bar, "name", "ru")), branch=(br["name"], loc(br, "name", "ru")), when=when,
-                       phone=(f"\n📞 {phone}" if phone else "")))
+                       phone=(f"\n📞 {phone}" if phone else ""))
+        if sent:
+            try:
+                await db.update("bookings", {"id": f"eq.{bk['id']}"}, {"staff_msgs": sent})
+            except Exception:
+                log.warning("staff_msgs saqlanmadi (bookings.staff_msgs ustuni bormi?)")
+    bg(send_staff())
     return bk
 
 
