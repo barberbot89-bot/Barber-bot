@@ -114,6 +114,10 @@ MSG["ru"].update({
 })
 
 
+MSG["uz"]["barber_linked"] = "✅ Siz usta sifatida ulandingiz: {barber}\nEndi sizga yozilgan mijozlar haqidagi xabarlar shu yerga keladi."
+MSG["ru"]["barber_linked"] = "✅ Вы подключены как мастер: {barber}\nТеперь уведомления о записях к вам будут приходить сюда."
+
+
 async def edit_or_send(chat_id: int, msg_id, text: str):
     if msg_id:
         try:
@@ -237,10 +241,21 @@ def _kw_lang(kw: dict, lg) -> dict:
     return {k: (((v[1] or v[0]) if lg == "ru" else v[0]) if isinstance(v, tuple) else v) for k, v in kw.items()}
 
 
-async def notify_staff(key: str, markup_fn=None, **kw) -> dict:
-    """Barcha adminlarga yuboradi. Qaytaradi: {chat_id(str): message_id}"""
+async def booking_staff(barber: dict) -> list[dict]:
+    """Bron xabari kimga borishi: owner + o'sha barber (Telegramga ulangan bo'lsa)."""
+    ids = [OWNER_ID]
+    tid = barber.get("telegram_id")
+    if tid and int(tid) != OWNER_ID:
+        ids.append(int(tid))
+    rows = await db.select("users", {"telegram_id": f"in.({','.join(map(str, ids))})", "select": "telegram_id,lang"})
+    langs = {r["telegram_id"]: r.get("lang") for r in rows}
+    return [{"telegram_id": i, "lang": langs.get(i)} for i in ids]
+
+
+async def notify_staff(key: str, markup_fn=None, to: Optional[list] = None, **kw) -> dict:
+    """`to` berilsa faqat shularga, aks holda barcha owner/adminlarga yuboradi. Qaytaradi: {chat_id(str): message_id}"""
     sent = {}
-    for s in await staff_users():
+    for s in (to if to is not None else await staff_users()):
         lg = s.get("lang")
         m = await notify(s["telegram_id"], tr(lg, key, **_kw_lang(kw, lg)), markup_fn(lg) if markup_fn else None)
         if m:
@@ -253,7 +268,8 @@ async def edit_staff_msgs(b: dict, key: str, **kw) -> bool:
     msgs = b.get("staff_msgs") or {}
     if not msgs:
         return False
-    langs = {str(s["telegram_id"]): s.get("lang") for s in await staff_users()}
+    rows = await db.select("users", {"telegram_id": f"in.({','.join(str(c) for c in msgs)})", "select": "telegram_id,lang"})
+    langs = {str(r["telegram_id"]): r.get("lang") for r in rows}
     for cid, mid in msgs.items():
         lg = langs.get(cid)
         await edit_or_send(int(cid), mid, tr(lg, key, **_kw_lang(kw, lg)))
@@ -297,7 +313,7 @@ def shop_out(r: dict) -> dict:
     }
 
 
-BARBER_COLS = "id,branch_id,name,name_ru,active,photo_ver"
+BARBER_COLS = "id,branch_id,name,name_ru,active,photo_ver,telegram_id"
 
 
 def barber_out(r: dict, min_price=None) -> dict:
@@ -543,10 +559,18 @@ async def cmd_start(m: Message, command: CommandObject):
     arg = command.args or ""
     if arg.startswith("adm_") and u["role"] == "client":
         code = arg[4:]
-        used = await db.update("invites", {"code": f"eq.{code}", "used": "eq.false"}, {"used": True})
+        used = await db.update("invites", {"code": f"eq.{code}", "used": "eq.false", "barber_id": "is.null"}, {"used": True})
         if used:
             u = (await db.update("users", {"telegram_id": f"eq.{u['telegram_id']}"}, {"role": "admin"}))[0]
             await m.answer(tr(u.get("lang"), "admin_now"))
+        else:
+            await m.answer(tr(u.get("lang"), "invite_bad"))
+    elif arg.startswith("brb_"):
+        code = arg[4:]
+        used = await db.update("invites", {"code": f"eq.{code}", "used": "eq.false", "barber_id": "not.is.null"}, {"used": True})
+        rows = await db.update("barbers", {"id": f"eq.{used[0]['barber_id']}"}, {"telegram_id": u["telegram_id"]}) if used else []
+        if rows:
+            await m.answer(tr(u.get("lang"), "barber_linked", barber=loc(rows[0], "name", u.get("lang"))))
         else:
             await m.answer(tr(u.get("lang"), "invite_bad"))
 
@@ -580,11 +604,12 @@ def map_link(b: dict) -> str:
 
 async def transition(bid: int, new: str, actor: dict) -> dict:
     rows = await db.select("bookings", [("id", f"eq.{bid}"),
-                           ("select", "*,barbers(name,name_ru),branches(name,name_ru,address,address_ru,lat,lng),users(name,lang)")])
+                           ("select", "*,barbers(name,name_ru,telegram_id),branches(name,name_ru,address,address_ru,lat,lng),users(name,lang)")])
     if not rows:
         raise HTTPException(404, "not_found")
     b = rows[0]
-    staff = actor["role"] in ("owner", "admin")
+    bar_tid = (b.get("barbers") or {}).get("telegram_id")
+    staff = actor["role"] in ("owner", "admin") or (bar_tid is not None and bar_tid == actor["telegram_id"])
     if not staff and b["client_id"] != actor["telegram_id"]:
         raise HTTPException(403, "forbidden")
     if new == "booked" and (not staff or b["status"] != "pending"):
@@ -611,7 +636,7 @@ async def transition(bid: int, new: str, actor: dict) -> dict:
             # tasdiqlanmagan bo'lsa -- eski xabarni almashtiramiz (yangi xabar yubormaymiz);
             # tasdiqlangan bo'lsa -- admin bilishi uchun yangi xabar yuboramiz
             if not (b["status"] == "pending" and await edit_staff_msgs(b, "staff_cancelled", **kw)):
-                await notify_staff("staff_cancelled", **kw)
+                await notify_staff("staff_cancelled", to=await booking_staff(b.get("barbers") or {}), **kw)
         else:
             await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "cancelled_by_staff", barber=barber, when=when, n=len(names), svcs=cancelled))
     return out
@@ -827,7 +852,7 @@ async def create_booking(b: BookingIn, u: dict = Depends(get_user)):
     bg(send_pending())
     async def send_staff():
         sent = await notify_staff("staff_new", lambda l: kb([(tr(l, "btn_ok"), f"ok:{bk['id']}"), (tr(l, "btn_no"), f"no:{bk['id']}")]),
-                       name=u["name"], svc=(names, names_ru), barber=(bar["name"], loc(bar, "name", "ru")), branch=(br["name"], loc(br, "name", "ru")), when=when,
+                       to=await booking_staff(bar), name=u["name"], svc=(names, names_ru), barber=(bar["name"], loc(bar, "name", "ru")), branch=(br["name"], loc(br, "name", "ru")), when=when,
                        phone=(f"\n📞 {phone}" if phone else ""))
         if sent:
             try:
@@ -1043,7 +1068,8 @@ async def admin_set_hours(branch_id: int, weekday: int, body: HoursIn, a: dict =
 # ---- barbers admin + days off
 @app.get("/api/admin/barbers")
 async def admin_barbers(a: dict = Depends(admin_user)):
-    return [barber_out(r) for r in await db.select("barbers", {"order": "id.asc", "select": BARBER_COLS})]
+    return [{**barber_out(r), "linked": bool(r.get("telegram_id"))}
+            for r in await db.select("barbers", {"order": "id.asc", "select": BARBER_COLS})]
 
 
 @app.post("/api/admin/barbers")
@@ -1115,4 +1141,22 @@ async def remove_admin(tid: int, o: dict = Depends(owner_user)):
     rows = await db.update("users", {"telegram_id": f"eq.{tid}", "role": "eq.admin"}, {"role": "client"})
     if not rows:
         raise HTTPException(404, "Admin topilmadi")
+    return {"ok": True}
+
+
+# ---- owner only: barberni Telegramga ulash
+@app.post("/api/admin/barbers/{bid}/invite")
+async def create_barber_invite(bid: int, o: dict = Depends(owner_user)):
+    if not await db.select("barbers", {"id": f"eq.{bid}", "select": "id"}):
+        raise HTTPException(404, "Topilmadi")
+    code = secrets.token_urlsafe(8)
+    await db.insert("invites", {"code": code, "barber_id": bid})
+    return {"link": f"https://t.me/{BOT_USERNAME}?start=brb_{code}"}
+
+
+@app.delete("/api/admin/barbers/{bid}/telegram")
+async def unlink_barber(bid: int, o: dict = Depends(owner_user)):
+    rows = await db.update("barbers", {"id": f"eq.{bid}"}, {"telegram_id": None})
+    if not rows:
+        raise HTTPException(404, "Topilmadi")
     return {"ok": True}
