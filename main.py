@@ -115,10 +115,6 @@ MSG["ru"].update({
 
 
 MSG["uz"]["barber_linked"] = "✅ Siz usta sifatida ulandingiz: {barber}\nEndi sizga yozilgan mijozlar haqidagi xabarlar shu yerga keladi."
-MSG["uz"]["staff_confirmed"] = "✅ Tasdiqlandi\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}\n👤 {by}"
-MSG["ru"]["staff_confirmed"] = "✅ Подтверждено\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}\n👤 {by}"
-MSG["uz"]["staff_rejected"] = "❌ Rad etildi\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}\n👤 {by}"
-MSG["ru"]["staff_rejected"] = "❌ Отклонено\n{name} — {svc}\n✂️ {barber}\n📍 {branch}\n📅 {when}\n👤 {by}"
 MSG["ru"]["barber_linked"] = "✅ Вы подключены как мастер: {barber}\nТеперь уведомления о записях к вам будут приходить сюда."
 
 
@@ -377,10 +373,7 @@ def verify_init_data(init_data: str) -> dict:
 async def get_user(x_init_data: str = Header(default="")) -> dict:
     tg = verify_init_data(x_init_data)
     name = f"{tg.get('first_name', '')} {tg.get('last_name', '')}".strip()
-    u = await ensure_user(tg["id"], name, tg.get("language_code"))
-    bars = await cached(f"mybar:{u['telegram_id']}", 60, {"barbers"},
-                        lambda: db.select("barbers", {"telegram_id": f"eq.{u['telegram_id']}", "select": "id"}))
-    return {**u, "barber_ids": [x["id"] for x in bars]}
+    return await ensure_user(tg["id"], name, tg.get("language_code"))
 
 
 async def admin_user(u: dict = Depends(get_user)) -> dict:
@@ -393,39 +386,6 @@ async def owner_user(u: dict = Depends(get_user)) -> dict:
     if u["role"] != "owner":
         raise HTTPException(403, "Faqat egasi uchun")
     return u
-
-
-async def staff_user(u: dict = Depends(get_user)) -> dict:
-    """Owner, admin yoki Telegramga ulangan barber."""
-    if u["role"] not in ("owner", "admin") and not u["barber_ids"]:
-        raise HTTPException(403, "Ruxsat yo'q")
-    return u
-
-
-def is_full(u: dict) -> bool:
-    return u["role"] in ("owner", "admin")
-
-
-def check_barber(u: dict, barber_id: int):
-    if not is_full(u) and barber_id not in u["barber_ids"]:
-        raise HTTPException(403, "Ruxsat yo'q")
-
-
-def barber_filter(u: dict, barber_id: int = 0):
-    """PostgREST filtri: barber faqat o'zinikini, owner/admin hammasini (yoki tanlangan barberni) ko'radi."""
-    if barber_id:
-        check_barber(u, barber_id)
-        return ("barber_id", f"eq.{barber_id}")
-    if is_full(u):
-        return None
-    return ("barber_id", f"in.({','.join(map(str, u['barber_ids']))})")
-
-
-def barber_scope_params(u: dict) -> dict:
-    p = {"order": "id.asc", "select": BARBER_COLS}
-    if not is_full(u):
-        p["id"] = f"in.({','.join(map(str, u['barber_ids']))})"
-    return p
 
 
 # ---------------------------------------------------------------- slots
@@ -664,12 +624,7 @@ async def transition(bid: int, new: str, actor: dict) -> dict:
     barber = loc(b.get("barbers") or {}, "name", lang)
     names = ((b.get("svc_names_ru") if lang == "ru" else None) or b.get("svc_names") or "").split(", ")
     svcs = "\n".join("• " + n for n in names)
-    bars, brs = b.get("barbers") or {}, b.get("branches") or {}
-    skw = dict(name=(b.get("users") or {}).get("name", ""), svc=(b.get("svc_names") or "", b.get("svc_names_ru") or b.get("svc_names") or ""),
-               barber=(loc(bars, "name", "uz"), loc(bars, "name", "ru")), branch=(loc(brs, "name", "uz"), loc(brs, "name", "ru")),
-               when=when, by=actor.get("name") or "")
     if new == "booked":
-        await edit_staff_msgs(b, "staff_confirmed", **skw)
         await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "confirmed", barber=barber, when=when, n=len(names), svcs=svcs,
                            branch=loc(b["branches"], "name", lang), addr=loc(b["branches"], "address", lang), map=map_link(b)))
     else:
@@ -683,8 +638,6 @@ async def transition(bid: int, new: str, actor: dict) -> dict:
             if not (b["status"] == "pending" and await edit_staff_msgs(b, "staff_cancelled", **kw)):
                 await notify_staff("staff_cancelled", to=await booking_staff(b.get("barbers") or {}), **kw)
         else:
-            if b["status"] == "pending":
-                await edit_staff_msgs(b, "staff_rejected", **skw)
             await edit_or_send(b["client_id"], b.get("client_msg_id"), tr(lang, "cancelled_by_staff", barber=barber, when=when, n=len(names), svcs=cancelled))
     return out
 
@@ -808,8 +761,7 @@ async def public_data():
 @app.get("/api/bootstrap")
 async def bootstrap(u: dict = Depends(get_user)):
     pub = await cached("public", 120, {"shop", "branches", "services", "barbers"}, public_data)
-    return {"me": {"id": u["telegram_id"], "name": u["name"], "role": ("barber" if u["role"] == "client" and u["barber_ids"] else u["role"]),
-                   "barber_ids": u["barber_ids"],
+    return {"me": {"id": u["telegram_id"], "name": u["name"], "role": u["role"],
                    "phone": u.get("phone"), "lang": u.get("lang") or "uz"}, **pub}
 
 
@@ -938,7 +890,7 @@ async def img_barber(bid: int):
 
 # ---------------------------------------------------------------- admin API
 @app.get("/api/admin/bookings")
-async def admin_bookings(date_: str, branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
+async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(admin_user)):
     try:
         d = date.fromisoformat(date_)
     except ValueError:
@@ -951,30 +903,23 @@ async def admin_bookings(date_: str, branch_id: int = 0, barber_id: int = 0, a: 
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
-    bf = barber_filter(a, barber_id)
-    if bf:
-        params.append(bf)
     return await db.select("bookings", params)
 
 
 @app.post("/api/admin/bookings/{bid}/status")
-async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(staff_user)):
+async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(admin_user)):
     if body.status in ("booked", "cancelled"):
         return await transition(bid, body.status, a)
     if body.status not in ("done", "no_show"):
         raise HTTPException(400, "Noto'g'ri holat")
-    flt = {"id": f"eq.{bid}"}
-    bf = barber_filter(a)
-    if bf:
-        flt[bf[0]] = bf[1]
-    rows = await db.update("bookings", flt, {"status": body.status})
+    rows = await db.update("bookings", {"id": f"eq.{bid}"}, {"status": body.status})
     if not rows:
         raise HTTPException(404, "Topilmadi")
     return rows[0]
 
 
 @app.get("/api/admin/report")
-async def admin_report(period: str = "day", branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
+async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depends(admin_user)):
     now = datetime.now(TZ)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if period == "month":
@@ -984,63 +929,41 @@ async def admin_report(period: str = "day", branch_id: int = 0, barber_id: int =
         end = start + timedelta(days=1)
     params = [
         ("start_at", f"gte.{start.isoformat()}"), ("start_at", f"lt.{end.isoformat()}"),
-        ("select", "status,total_price,svc_names,barber_id"),
+        ("select", "status,total_price,svc_names"),
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
-    bf = barber_filter(a, barber_id)
-    if bf:
-        params.append(bf)
     rows = await db.select("bookings", params)
     counts = {"booked": 0, "done": 0, "no_show": 0, "cancelled": 0}
-    revenue, by_service, by_b = 0, {}, {}
+    revenue, by_service = 0, {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
-        x = by_b.setdefault(r.get("barber_id"), {"booked": 0, "done": 0, "no_show": 0, "cancelled": 0, "revenue": 0})
-        x[r["status"]] = x.get(r["status"], 0) + 1
         if r["status"] == "done":
             revenue += r["total_price"] or 0
-            x["revenue"] += r["total_price"] or 0
             for n in (r["svc_names"] or "").split(", "):
                 by_service[n] = by_service.get(n, 0) + 1
     top = sorted(by_service.items(), key=lambda x: -x[1])
-    by_barber = []
-    if is_full(a):
-        names = {x["id"]: x for x in await db.select("barbers", {"select": "id,name,name_ru"})}
-        by_barber = [{"barber_id": k, "name": (names.get(k) or {}).get("name", ""), "name_ru": (names.get(k) or {}).get("name_ru"), **v}
-                     for k, v in by_b.items()]
     return {"period": period, "revenue": revenue, "counts": counts,
-            "by_service": [{"name": n, "count": c} for n, c in top], "by_barber": by_barber}
+            "by_service": [{"name": n, "count": c} for n, c in top]}
 
 
 # ---- services
 @app.get("/api/admin/services")
-async def admin_services(barber_id: int = 0, a: dict = Depends(staff_user)):
-    params = [("order", "id.asc")]
-    bf = barber_filter(a, barber_id)
-    if bf:
-        params.append(bf)
-    return await db.select("services", params)
+async def admin_services(a: dict = Depends(admin_user)):
+    return await db.select("services", {"order": "id.asc"})
 
 
 @app.post("/api/admin/services")
-async def admin_add_service(body: ServiceIn, a: dict = Depends(staff_user)):
-    data = body.model_dump()
-    if not is_full(a):
-        data["barber_id"] = body.barber_id if body.barber_id in a["barber_ids"] else a["barber_ids"][0]
-    return (await db.insert("services", data))[0]
+async def admin_add_service(body: ServiceIn, a: dict = Depends(admin_user)):
+    return (await db.insert("services", body.model_dump()))[0]
 
 
 @app.patch("/api/admin/services/{sid}")
-async def admin_edit_service(sid: int, body: ServicePatch, a: dict = Depends(staff_user)):
+async def admin_edit_service(sid: int, body: ServicePatch, a: dict = Depends(admin_user)):
     data = body.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(400, "O'zgartirish yo'q")
-    flt = {"id": f"eq.{sid}"}
-    bf = barber_filter(a)
-    if bf:
-        flt[bf[0]] = bf[1]
-    rows = await db.update("services", flt, data)
+    rows = await db.update("services", {"id": f"eq.{sid}"}, data)
     if not rows:
         raise HTTPException(404, "Topilmadi")
     return rows[0]
@@ -1124,11 +1047,7 @@ async def admin_branch_photo(bid: int, body: ImageIn, a: dict = Depends(admin_us
 
 # ---- work hours (per branch)
 @app.get("/api/admin/work-hours")
-async def admin_hours(branch_id: int, a: dict = Depends(staff_user)):
-    if not is_full(a):  # barber faqat o'z filialining ish vaqtini ko'ra oladi (o'zgartira olmaydi)
-        mine = await db.select("barbers", {"id": f"in.({','.join(map(str, a['barber_ids']))})", "select": "branch_id"})
-        if branch_id not in {m["branch_id"] for m in mine}:
-            raise HTTPException(403, "Ruxsat yo'q")
+async def admin_hours(branch_id: int, a: dict = Depends(admin_user)):
     return await db.select("work_hours", {"branch_id": f"eq.{branch_id}", "order": "weekday.asc"})
 
 
@@ -1148,9 +1067,9 @@ async def admin_set_hours(branch_id: int, weekday: int, body: HoursIn, a: dict =
 
 # ---- barbers admin + days off
 @app.get("/api/admin/barbers")
-async def admin_barbers(a: dict = Depends(staff_user)):
+async def admin_barbers(a: dict = Depends(admin_user)):
     return [{**barber_out(r), "linked": bool(r.get("telegram_id"))}
-            for r in await db.select("barbers", barber_scope_params(a))]
+            for r in await db.select("barbers", {"order": "id.asc", "select": BARBER_COLS})]
 
 
 @app.post("/api/admin/barbers")
@@ -1161,13 +1080,8 @@ async def admin_add_barber(body: BarberIn, a: dict = Depends(admin_user)):
 
 
 @app.patch("/api/admin/barbers/{bid}")
-async def admin_edit_barber(bid: int, body: BarberPatch, a: dict = Depends(staff_user)):
-    check_barber(a, bid)
+async def admin_edit_barber(bid: int, body: BarberPatch, a: dict = Depends(admin_user)):
     data = body.model_dump(exclude_none=True)
-    if not is_full(a):  # barber filial va faollikni o'zgartira olmaydi
-        data = {k: v for k, v in data.items() if k in ("name", "name_ru")}
-    if "name" in data and not data["name"].strip():
-        raise HTTPException(400, "Ismni kiriting")
     if not data:
         raise HTTPException(400, "O'zgartirish yo'q")
     rows = await db.update("barbers", {"id": f"eq.{bid}"}, data)
@@ -1177,8 +1091,7 @@ async def admin_edit_barber(bid: int, body: BarberPatch, a: dict = Depends(staff
 
 
 @app.put("/api/admin/barbers/{bid}/photo")
-async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(staff_user)):
-    check_barber(a, bid)
+async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(admin_user)):
     check_image(body.data)
     cur = await db.select("barbers", {"id": f"eq.{bid}", "select": "photo_ver"})
     if not cur:
@@ -1189,14 +1102,12 @@ async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(staff_us
 
 
 @app.get("/api/admin/days-off")
-async def admin_days_off(barber_id: int, a: dict = Depends(staff_user)):
-    check_barber(a, barber_id)
+async def admin_days_off(barber_id: int, a: dict = Depends(admin_user)):
     return await db.select("days_off", {"barber_id": f"eq.{barber_id}", "order": "day.asc"})
 
 
 @app.post("/api/admin/days-off")
-async def admin_set_day_off(body: DayOffIn, a: dict = Depends(staff_user)):
-    check_barber(a, body.barber_id)
+async def admin_set_day_off(body: DayOffIn, a: dict = Depends(admin_user)):
     try:
         day = date.fromisoformat(body.day).isoformat()
     except ValueError:
@@ -1249,18 +1160,3 @@ async def unlink_barber(bid: int, o: dict = Depends(owner_user)):
     if not rows:
         raise HTTPException(404, "Topilmadi")
     return {"ok": True}
-
-
-# ---- jadval: har bir barber alohida (owner/admin hammasini, barber faqat o'zini ko'radi)
-@app.get("/api/admin/schedule")
-async def admin_schedule(date_: str, branch_id: int = 0, a: dict = Depends(staff_user)):
-    rows = await admin_bookings(date_, branch_id, 0, a)
-    params = barber_scope_params(a)
-    if branch_id and is_full(a):
-        params["branch_id"] = f"eq.{branch_id}"
-    bars = await db.select("barbers", params)
-    by: dict = {}
-    for r in rows:
-        by.setdefault(r["barber_id"], []).append(r)
-    return [{"barber": barber_out(b), "bookings": by.get(b["id"], [])}
-            for b in bars if b.get("active", True) or by.get(b["id"])]
