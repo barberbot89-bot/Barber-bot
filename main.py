@@ -937,7 +937,7 @@ async def img_barber(bid: int):
 
 # ---------------------------------------------------------------- admin API
 @app.get("/api/admin/bookings")
-async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(staff_user)):
+async def admin_bookings(date_: str, branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
     try:
         d = date.fromisoformat(date_)
     except ValueError:
@@ -950,6 +950,8 @@ async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(staff
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
+    if barber_id:
+        params.append(("barber_id", f"eq.{barber_id}"))
     if a["scope"] is not None:
         params.append(("barber_id", in_list(a["scope"])))
     return await db.select("bookings", params)
@@ -979,7 +981,7 @@ async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(staff_use
 
 
 @app.get("/api/admin/report")
-async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depends(staff_user)):
+async def admin_report(period: str = "day", branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
     now = datetime.now(TZ)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if period == "month":
@@ -989,20 +991,29 @@ async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depend
         end = start + timedelta(days=1)
     params = [
         ("start_at", f"gte.{start.isoformat()}"), ("start_at", f"lt.{end.isoformat()}"),
-        ("select", "status,total_price,svc_names"),
+        ("select", "status,total_price,svc_names,service_id,service_ids"),
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
+    if barber_id:
+        params.append(("barber_id", f"eq.{barber_id}"))
     if a["scope"] is not None:
         params.append(("barber_id", in_list(a["scope"])))
     rows = await db.select("bookings", params)
     counts = {"booked": 0, "done": 0, "no_show": 0, "cancelled": 0}
-    revenue, by_service = 0, {}
+    revenue, by_service, names_map = 0, {}, None
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         if r["status"] == "done":
             revenue += r["total_price"] or 0
-            for n in (r["svc_names"] or "").split(", "):
+            if names_map is None:
+                names_map = {x["id"]: x["name"] for x in await db.select("services", {"select": "id,name"})}
+            # nomlar xizmat ID'laridan olinadi (eski yozuvlarda svc_names bo'sh bo'lishi mumkin)
+            ids = r.get("service_ids") or ([r["service_id"]] if r.get("service_id") else [])
+            names = [names_map[i] for i in ids if i in names_map]
+            if not names:
+                names = [n.strip() for n in (r.get("svc_names") or "").split(", ") if n.strip()]
+            for n in names:
                 by_service[n] = by_service.get(n, 0) + 1
     top = sorted(by_service.items(), key=lambda x: -x[1])
     return {"period": period, "revenue": revenue, "counts": counts,
