@@ -1020,6 +1020,156 @@ async def admin_report(period: str = "day", branch_id: int = 0, barber_id: int =
             "by_service": [{"name": n, "count": c} for n, c in top]}
 
 
+# ---- analytics (hisobot): bitta hisob-kitob funksiyasi -- dashboard (keyin eksport va avtomatik hisobot) shundan foydalanadi
+async def select_all(table, params, page=1000):
+    """PostgREST 1000 qatordan ortig'ini qaytarmaydi, shuning uchun sahifalab o'qiymiz."""
+    out, off = [], 0
+    while True:
+        rows = await db.select(table, list(params) + [("order", "id.asc"), ("limit", page), ("offset", off)])
+        out += rows
+        if len(rows) < page:
+            return out
+        off += page
+
+
+def _pct(part, whole):
+    return round(part * 100 / whole, 1) if whole else None
+
+
+def compute_analytics(rows, d1, d2, now, prior_clients, svc_map, group_month):
+    """Sof hisob-kitob (bazaga tegmaydi). rows -- davrdagi bronlar."""
+    counts = {"pending": 0, "booked": 0, "done": 0, "no_show": 0, "cancelled": 0}
+    elig = {"done": 0, "no_show": 0, "cancelled": 0}  # natijasi ma'lum, o'tib ketgan bronlar
+    revenue, by_service, visits = 0, {}, {}
+    if group_month:
+        keys, y, m = [], d1.year, d1.month
+        while (y, m) <= (d2.year, d2.month):
+            keys.append(f"{y:04d}-{m:02d}")
+            m += 1
+            if m == 13:
+                y, m = y + 1, 1
+    else:
+        keys = [(d1 + timedelta(days=i)).isoformat() for i in range((d2 - d1).days + 1)]
+    series = {k: {"k": k, "revenue": 0, "done": 0, "cancelled": 0} for k in keys}
+    for r in rows:
+        st = r["status"]
+        counts[st] = counts.get(st, 0) + 1
+        start = pdt(r["start_at"]).astimezone(TZ)
+        b = series.get(start.strftime("%Y-%m") if group_month else start.date().isoformat())
+        if start < now and st in elig:
+            elig[st] += 1
+        if st == "cancelled" and b:
+            b["cancelled"] += 1
+        if st != "done":
+            continue
+        price = r.get("total_price") or 0
+        revenue += price
+        if b:
+            b["revenue"] += price
+            b["done"] += 1
+        ids = r.get("service_ids") or ([r["service_id"]] if r.get("service_id") else [])
+        names = [svc_map[i] for i in ids if i in svc_map]
+        if not names:  # eski yozuvlar: matndan
+            names = [n.strip() for n in (r.get("svc_names") or "").split(", ") if n.strip()]
+        for n in names:
+            by_service[n] = by_service.get(n, 0) + 1
+        cid = r.get("client_id")
+        if cid is not None:
+            v = visits.setdefault(cid, [0, 0])
+            v[0] += 1
+            v[1] += price
+    done_n = counts["done"]
+    unique = len(visits)
+    returning = sum(1 for c in visits if c in prior_clients)
+    denom = sum(elig.values())
+    vals = list(series.values())
+    best = max(vals, key=lambda x: x["done"], default=None)
+    worst = max(vals, key=lambda x: x["cancelled"], default=None)
+    top_raw = sorted(((c, v[0], v[1]) for c, v in visits.items() if v[0] >= 2), key=lambda x: (-x[1], -x[2]))[:5]
+    return {
+        "revenue": revenue,
+        "avg_check": round(revenue / done_n) if done_n else None,
+        "counts": counts,
+        "upcoming": counts["pending"] + counts["booked"],
+        "customers": {"unique": unique, "returning": returning, "new": unique - returning,
+                      "returning_rate": _pct(returning, unique)},
+        "rates": {"eligible": denom, "completion": _pct(elig["done"], denom),
+                  "cancelled": _pct(elig["cancelled"], denom), "no_show": _pct(elig["no_show"], denom)},
+        "by_service": [{"name": n, "count": c} for n, c in sorted(by_service.items(), key=lambda x: -x[1])],
+        "series": vals,
+        "group": "month" if group_month else "day",
+        "insights": {
+            "best": {"k": best["k"], "count": best["done"]} if best and best["done"] else None,
+            "worst_cancel": {"k": worst["k"], "count": worst["cancelled"]} if worst and worst["cancelled"] else None,
+        },
+        "top_raw": top_raw,
+    }
+
+
+@app.get("/api/admin/analytics")
+async def admin_analytics(start: str, end: str, prev_start: str = "", prev_end: str = "",
+                          branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
+    try:
+        d1, d2 = date.fromisoformat(start), date.fromisoformat(end)
+        p1 = date.fromisoformat(prev_start) if prev_start and prev_end else None
+        p2 = date.fromisoformat(prev_end) if prev_start and prev_end else None
+    except ValueError:
+        raise HTTPException(400, "Sana noto'g'ri")
+    if d1 > d2 or (p1 and p1 > p2):
+        raise HTTPException(400, "Boshlanish sanasi tugash sanasidan keyin bo'lishi mumkin emas")
+    days = (d2 - d1).days + 1
+    if days > 366:
+        raise HTTPException(400, "Davr 1 yildan oshmasligi kerak")
+    if not p1:  # oldingi teng davr
+        p2 = d1 - timedelta(days=1)
+        p1 = p2 - timedelta(days=days - 1)
+
+    flt = []
+    if branch_id:
+        flt.append(("branch_id", f"eq.{branch_id}"))
+    if barber_id:
+        flt.append(("barber_id", f"eq.{barber_id}"))
+    if a["scope"] is not None:
+        flt.append(("barber_id", in_list(a["scope"])))
+
+    lo, hi = datetime.combine(d1, dtime.min, TZ), datetime.combine(d2 + timedelta(days=1), dtime.min, TZ)
+    plo, phi = datetime.combine(p1, dtime.min, TZ), datetime.combine(p2 + timedelta(days=1), dtime.min, TZ)
+    rows = await select_all("bookings", [
+        ("start_at", f"gte.{lo.isoformat()}"), ("start_at", f"lt.{hi.isoformat()}"),
+        ("select", "status,total_price,start_at,client_id,service_id,service_ids,svc_names")] + flt)
+    prev_rows = await select_all("bookings", [
+        ("status", "eq.done"), ("start_at", f"gte.{plo.isoformat()}"), ("start_at", f"lt.{phi.isoformat()}"),
+        ("select", "total_price")] + flt)
+    prev_rev = sum(r["total_price"] or 0 for r in prev_rows)
+
+    done_clients = sorted({r["client_id"] for r in rows if r["status"] == "done" and r.get("client_id") is not None})
+    prior = set()  # shu davrdan oldin bajarilgan vizit bo'lgan mijozlar (do'kon bo'yicha)
+    for i in range(0, len(done_clients), 100):
+        pf = [("status", "eq.done"), ("start_at", f"lt.{lo.isoformat()}"),
+              ("client_id", in_list(done_clients[i:i + 100])), ("select", "client_id")]
+        if a["scope"] is not None:
+            pf.append(("barber_id", in_list(a["scope"])))
+        prior |= {x["client_id"] for x in await select_all("bookings", pf)}
+
+    svc_map = {}
+    if any(r["status"] == "done" for r in rows):
+        svc_map = {x["id"]: x["name"] for x in await db.select("services", {"select": "id,name"})}
+
+    out = compute_analytics(rows, d1, d2, datetime.now(TZ), prior, svc_map, days > 62)
+    top_raw = out.pop("top_raw")
+    names = {}
+    if top_raw:
+        us = await db.select("users", [("telegram_id", in_list([c for c, _, _ in top_raw])), ("select", "telegram_id,name")])
+        names = {u["telegram_id"]: u["name"] for u in us}
+    out["top_customers"] = [{"name": names.get(c) or "—", "visits": n, "revenue": rev} for c, n, rev in top_raw]
+    diff = out["revenue"] - prev_rev
+    out["compare"] = {"current": out["revenue"], "previous": prev_rev, "diff": diff,
+                      "pct": _pct(diff, prev_rev) if prev_rev else None,
+                      "prev_start": p1.isoformat(), "prev_end": p2.isoformat()}
+    out["range"] = {"start": d1.isoformat(), "end": d2.isoformat(), "days": days}
+    return out
+
+
 # ---- services
 @app.get("/api/admin/services")
 async def admin_services(a: dict = Depends(staff_user)):
