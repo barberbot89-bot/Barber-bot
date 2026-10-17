@@ -396,6 +396,31 @@ async def admin_user(u: dict = Depends(get_user)) -> dict:
     return u
 
 
+async def barber_ids_of(tid: int) -> list:
+    rows = await cached(f"barber_ids:{tid}", 60, {"barbers"},
+                        lambda: db.select("barbers", {"telegram_id": f"eq.{tid}", "select": "id"}))
+    return [r["id"] for r in rows]
+
+
+async def staff_user(u: dict = Depends(get_user)) -> dict:
+    """Owner/admin (scope=None, hammasi) yoki Telegramga ulangan usta (scope=[o'z barber id'lari])."""
+    if u["role"] in ("owner", "admin"):
+        return {**u, "scope": None}
+    ids = await barber_ids_of(u["telegram_id"])
+    if not ids:
+        raise HTTPException(403, "Ruxsat yo'q")
+    return {**u, "scope": ids}
+
+
+def in_list(ids: list) -> str:
+    return "in.(" + ",".join(str(int(i)) for i in ids) + ")"
+
+
+def need_own_barber(a: dict, barber_id) -> None:
+    if a["scope"] is not None and barber_id not in a["scope"]:
+        raise HTTPException(403, "Ruxsat yo'q")
+
+
 async def owner_user(u: dict = Depends(get_user)) -> dict:
     if u["role"] != "owner":
         raise HTTPException(403, "Faqat egasi uchun")
@@ -782,6 +807,7 @@ async def public_data():
 async def bootstrap(u: dict = Depends(get_user)):
     pub = await cached("public", 120, {"shop", "branches", "services", "barbers"}, public_data)
     return {"me": {"id": u["telegram_id"], "name": u["name"], "role": u["role"],
+                   "barber": bool(await barber_ids_of(u["telegram_id"])),
                    "phone": u.get("phone"), "lang": u.get("lang") or "uz"}, **pub}
 
 
@@ -911,7 +937,7 @@ async def img_barber(bid: int):
 
 # ---------------------------------------------------------------- admin API
 @app.get("/api/admin/bookings")
-async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(admin_user)):
+async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(staff_user)):
     try:
         d = date.fromisoformat(date_)
     except ValueError:
@@ -924,13 +950,26 @@ async def admin_bookings(date_: str, branch_id: int = 0, a: dict = Depends(admin
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
+    if a["scope"] is not None:
+        params.append(("barber_id", in_list(a["scope"])))
     return await db.select("bookings", params)
 
 
 @app.post("/api/admin/bookings/{bid}/status")
-async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(admin_user)):
+async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(staff_user)):
+    if a["scope"] is not None:
+        cur = await db.select("bookings", {"id": f"eq.{bid}", "select": "barber_id"})
+        if not cur:
+            raise HTTPException(404, "Topilmadi")
+        need_own_barber(a, cur[0]["barber_id"])
     if body.status in ("booked", "cancelled"):
-        return await transition(bid, body.status, a)
+        out = await transition(bid, body.status, a)
+        for cid, mid in (out.get("staff_msgs") or {}).items():  # botdagi xabarlarda tugmalar qolib ketmasin
+            try:
+                await bot.edit_message_reply_markup(chat_id=int(cid), message_id=mid, reply_markup=None)
+            except Exception:
+                pass
+        return out
     if body.status not in ("done", "no_show"):
         raise HTTPException(400, "Noto'g'ri holat")
     rows = await db.update("bookings", {"id": f"eq.{bid}"}, {"status": body.status})
@@ -940,7 +979,7 @@ async def admin_set_status(bid: int, body: StatusIn, a: dict = Depends(admin_use
 
 
 @app.get("/api/admin/report")
-async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depends(admin_user)):
+async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depends(staff_user)):
     now = datetime.now(TZ)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     if period == "month":
@@ -954,6 +993,8 @@ async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depend
     ]
     if branch_id:
         params.append(("branch_id", f"eq.{branch_id}"))
+    if a["scope"] is not None:
+        params.append(("barber_id", in_list(a["scope"])))
     rows = await db.select("bookings", params)
     counts = {"booked": 0, "done": 0, "no_show": 0, "cancelled": 0}
     revenue, by_service = 0, {}
@@ -970,20 +1011,29 @@ async def admin_report(period: str = "day", branch_id: int = 0, a: dict = Depend
 
 # ---- services
 @app.get("/api/admin/services")
-async def admin_services(a: dict = Depends(admin_user)):
-    return await db.select("services", {"order": "id.asc"})
+async def admin_services(a: dict = Depends(staff_user)):
+    params = {"order": "id.asc"}
+    if a["scope"] is not None:
+        params["barber_id"] = in_list(a["scope"])
+    return await db.select("services", params)
 
 
 @app.post("/api/admin/services")
-async def admin_add_service(body: ServiceIn, a: dict = Depends(admin_user)):
+async def admin_add_service(body: ServiceIn, a: dict = Depends(staff_user)):
+    need_own_barber(a, body.barber_id)
     return (await db.insert("services", body.model_dump()))[0]
 
 
 @app.patch("/api/admin/services/{sid}")
-async def admin_edit_service(sid: int, body: ServicePatch, a: dict = Depends(admin_user)):
+async def admin_edit_service(sid: int, body: ServicePatch, a: dict = Depends(staff_user)):
     data = body.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(400, "O'zgartirish yo'q")
+    if a["scope"] is not None:
+        cur = await db.select("services", {"id": f"eq.{sid}", "select": "barber_id"})
+        if not cur:
+            raise HTTPException(404, "Topilmadi")
+        need_own_barber(a, cur[0]["barber_id"])
     rows = await db.update("services", {"id": f"eq.{sid}"}, data)
     if not rows:
         raise HTTPException(404, "Topilmadi")
@@ -1020,8 +1070,15 @@ async def admin_set_logo(body: ImageIn, a: dict = Depends(admin_user)):
 
 # ---- branches
 @app.get("/api/admin/branches")
-async def admin_branches(a: dict = Depends(admin_user)):
-    rows = await db.select("branches", {"order": "id.asc", "select": BRANCH_COLS})
+async def admin_branches(a: dict = Depends(staff_user)):
+    params = {"order": "id.asc", "select": BRANCH_COLS}
+    if a["scope"] is not None:
+        mine = await db.select("barbers", {"id": in_list(a["scope"]), "select": "branch_id"})
+        bids = sorted({r["branch_id"] for r in mine if r.get("branch_id") is not None})
+        if not bids:
+            return []
+        params["id"] = in_list(bids)
+    rows = await db.select("branches", params)
     return [branch_out(r) for r in rows]
 
 
@@ -1088,8 +1145,11 @@ async def admin_set_hours(branch_id: int, weekday: int, body: HoursIn, a: dict =
 
 # ---- barbers admin + days off
 @app.get("/api/admin/barbers")
-async def admin_barbers(a: dict = Depends(admin_user)):
-    return [barber_admin_out(r) for r in await db.select("barbers", {"order": "id.asc", "select": BARBER_COLS_ADM})]
+async def admin_barbers(a: dict = Depends(staff_user)):
+    params = {"order": "id.asc", "select": BARBER_COLS_ADM}
+    if a["scope"] is not None:
+        params["id"] = in_list(a["scope"])
+    return [barber_admin_out(r) for r in await db.select("barbers", params)]
 
 
 @app.post("/api/admin/barbers")
@@ -1100,8 +1160,13 @@ async def admin_add_barber(body: BarberIn, a: dict = Depends(admin_user)):
 
 
 @app.patch("/api/admin/barbers/{bid}")
-async def admin_edit_barber(bid: int, body: BarberPatch, a: dict = Depends(admin_user)):
+async def admin_edit_barber(bid: int, body: BarberPatch, a: dict = Depends(staff_user)):
+    need_own_barber(a, bid)
     data = body.model_dump(exclude_none=True)
+    if a["scope"] is not None:  # usta faqat ism va ruscha ismini o'zgartira oladi
+        data = {k: v for k, v in data.items() if k in ("name", "name_ru")}
+        if "name" in data and not data["name"].strip():
+            raise HTTPException(400, "Ismni kiriting")
     if not data:
         raise HTTPException(400, "O'zgartirish yo'q")
     rows = await db.update("barbers", {"id": f"eq.{bid}"}, data)
@@ -1128,7 +1193,8 @@ async def barber_unlink(bid: int, a: dict = Depends(admin_user)):
 
 
 @app.put("/api/admin/barbers/{bid}/photo")
-async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(admin_user)):
+async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(staff_user)):
+    need_own_barber(a, bid)
     check_image(body.data)
     cur = await db.select("barbers", {"id": f"eq.{bid}", "select": "photo_ver"})
     if not cur:
@@ -1139,12 +1205,14 @@ async def admin_barber_photo(bid: int, body: ImageIn, a: dict = Depends(admin_us
 
 
 @app.get("/api/admin/days-off")
-async def admin_days_off(barber_id: int, a: dict = Depends(admin_user)):
+async def admin_days_off(barber_id: int, a: dict = Depends(staff_user)):
+    need_own_barber(a, barber_id)
     return await db.select("days_off", {"barber_id": f"eq.{barber_id}", "order": "day.asc"})
 
 
 @app.post("/api/admin/days-off")
-async def admin_set_day_off(body: DayOffIn, a: dict = Depends(admin_user)):
+async def admin_set_day_off(body: DayOffIn, a: dict = Depends(staff_user)):
+    need_own_barber(a, body.barber_id)
     try:
         day = date.fromisoformat(body.day).isoformat()
     except ValueError:
