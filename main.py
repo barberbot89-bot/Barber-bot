@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import (
     InlineKeyboardButton,
@@ -741,8 +742,10 @@ async def lifespan(app: FastAPI):
             menu_button=MenuButtonWebApp(text="✂️ Yozilish", web_app=WebAppInfo(url=WEBAPP_URL))
         )
     task = asyncio.create_task(reminder_loop())
+    task2 = asyncio.create_task(report_loop())
     yield
     task.cancel()
+    task2.cancel()
     await bot.session.close()
     await db.close()
 
@@ -1452,6 +1455,166 @@ async def admin_export(fmt: str, start: str, end: str, branch_id: int = 0, barbe
         log.exception("eksport yuborilmadi")
         raise HTTPException(502, "Faylni Telegramga yuborib bo'lmadi. Botni ishga tushirganingizni tekshiring.")
     return {"ok": True}
+
+
+# ---- avtomatik haftalik/oylik hisobotlar (faqat egasiga, fon vazifa)
+def report_period(kind, today):
+    """Oxirgi TUGAGAN davr: haftalik -- o'tgan dushanba..yakshanba, oylik -- o'tgan kalendar oy."""
+    if kind == "weekly":
+        mon = today - timedelta(days=today.weekday())
+        return mon - timedelta(days=7), mon - timedelta(days=1)
+    end = today.replace(day=1) - timedelta(days=1)
+    return end.replace(day=1), end
+
+
+def report_due(kind, now):
+    """Yuborish oynasi: dushanba (yoki oyning 1-kuni) 09:00 dan kun oxirigacha. Aks holda None."""
+    if now.hour < 9:
+        return None
+    if (kind == "weekly" and now.weekday() != 0) or (kind == "monthly" and now.day != 1):
+        return None
+    return report_period(kind, now.date())
+
+
+def enable_mark(kind, now, cur_last):
+    """Hisobot yoqilganda: agar yuborish oynasi allaqachon ochiq bo'lsa, o'sha (eski) davr
+    yuborilgan hisoblanadi -- toggle bosilishi bilan eski hisobot kelmaydi."""
+    due = report_due(kind, now)
+    if due and (not cur_last or date.fromisoformat(cur_last) < due[0]):
+        return due[0]
+    return None
+
+
+def format_report(kind, o, by_barber, by_branch):
+    """Telegram uchun qisqa matn (sof funksiya). Hisoblab bo'lmaydigan ko'rsatkichlar tashlab ketiladi."""
+    c, cu, cnt = o["compare"], o["customers"], o["counts"]
+    prev = "O‘tgan haftaga" if kind == "weekly" else "O‘tgan oyga"
+    L = [f"📊 {'Haftalik' if kind == 'weekly' else 'Oylik'} hisobot",
+         f"{_dmy(o['range']['start'])} – {_dmy(o['range']['end'])}", "", f"💰 Tushum: {_money(o['revenue'])}"]
+    if c["diff"] == 0:
+        L.append(f"➖ {prev} nisbatan: o‘zgarmagan" if c["previous"] else "➖ Ikkala davrda ham tushum yo‘q")
+    elif c["pct"] is None:
+        L.append(f"📈 {prev} nisbatan: +{_money(c['diff'])} (oldingi davrda tushum bo‘lmagan)")
+    else:
+        sg = "+" if c["diff"] > 0 else "−"
+        L.append(f"{'📈' if c['diff'] > 0 else '📉'} {prev} nisbatan: {sg}{_money(abs(c['diff']))} ({sg}{abs(c['pct'])}%)")
+    if o["avg_check"] is not None:
+        L.append(f"🧾 O‘rtacha chek: {_money(o['avg_check'])}")
+    L += ["", f"✅ Bajarilgan: {cnt['done']}", f"❌ Bekor qilingan: {cnt['cancelled']}", f"🚫 Kelmagan: {cnt['no_show']}"]
+    if cu["unique"]:
+        L += ["", f"👥 Mijozlar: {cu['unique']} (yangi {cu['new']}, qaytgan {cu['returning']})"]
+    if o["by_service"]:
+        L += ["", "🔥 Ko‘p so‘ralgan xizmatlar:"] + [f"{i}. {x['name']} — {x['count']}" for i, x in enumerate(o["by_service"][:3], 1)]
+    if len(by_barber) > 1:
+        L += ["", "✂️ Ustalar:"] + [f"• {x['name']}: {x['done']} ta, {_money(x['revenue'])}" for x in by_barber[:8]]
+    if len(by_branch) > 1:
+        L += ["", "🏢 Filiallar:"] + [f"• {x['name']}: {x['done']} ta, {_money(x['revenue'])}" for x in by_branch[:8]]
+    L += ["", "Excel/PDF uchun: ilovada Hisobot bo‘limi."]
+    return "\n".join(L)
+
+
+async def build_report_text(kind, start, end):
+    p1, p2 = report_period(kind, start)  # start dushanba/1-sana bo'lgani uchun bu oldingi davr
+    out, rows = await build_report(start, end, p1, p2, 0, 0, None, daily=True)
+    branches = {x["id"]: x["name"] for x in await db.select("branches", {"select": "id,name"})}
+    barbers = {x["id"]: x["name"] for x in await db.select("barbers", {"select": "id,name"})}
+    bb, br = compute_breakdowns(rows, barbers, branches)
+    return format_report(kind, out, bb, br)
+
+
+async def claim_report(kind, start):
+    """Davrni atomik band qilish: faqat oxirgi yuborilgan davr shundan eski bo'lsa o'tadi.
+    Bir nechta nusxa yoki qayta ishga tushirishda ham bitta xabar chiqadi."""
+    col = f"{kind}_last"
+    rows = await db.update("shop", {"id": "eq.1", "or": f"({col}.is.null,{col}.lt.{start.isoformat()})"}, {col: start.isoformat()})
+    return bool(rows)
+
+
+async def unclaim_report(kind, start, prev):
+    col = f"{kind}_last"
+    await db.update("shop", {"id": "eq.1", col: f"eq.{start.isoformat()}"}, {col: prev})
+
+
+def _err_text(e):
+    return f"{type(e).__name__}: {e}".replace(BOT_TOKEN, "***")[:200]
+
+
+_report_tries: dict = {}  # (tur, davr boshi) -> urinishlar soni; cheksiz qayta urinmaslik uchun
+
+
+async def send_due_reports():
+    now = datetime.now(TZ)
+    rows = await db.select("shop", {"id": "eq.1", "select": "weekly_report,monthly_report,weekly_last,monthly_last"})
+    if not rows:
+        return
+    sh = rows[0]
+    for kind in ("weekly", "monthly"):
+        if not sh.get(f"{kind}_report"):
+            continue
+        per = report_due(kind, now)
+        if not per:
+            continue
+        start, end = per
+        last = sh.get(f"{kind}_last")
+        key = (kind, start)
+        if (last and date.fromisoformat(last) >= start) or _report_tries.get(key, 0) >= 3:
+            continue
+        if not await claim_report(kind, start):
+            continue  # boshqa nusxa yoki oldingi urinish allaqachon band qilgan
+        _report_tries[key] = _report_tries.get(key, 0) + 1
+        try:
+            text = await build_report_text(kind, start, end)
+            await bot.send_message(OWNER_ID, text)
+            await db.update("shop", {"id": "eq.1"}, {"report_error": None})
+        except TelegramForbiddenError as e:  # bot bloklangan: shu davr uchun qayta urinmaymiz
+            _report_tries[key] = 99
+            log.warning("avtomatik hisobot yuborilmadi (bot bloklangan)")
+            await db.update("shop", {"id": "eq.1"}, {"report_error": _err_text(e)})
+        except Exception as e:
+            log.warning("avtomatik hisobot xatosi: %s", _err_text(e))
+            await unclaim_report(kind, start, last)  # keyingi daqiqada qayta uriniladi (eng ko'pi 3 marta)
+            await db.update("shop", {"id": "eq.1"}, {"report_error": _err_text(e)})
+
+
+async def report_loop():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await send_due_reports()
+        except Exception:
+            log.exception("report loop error")
+        await asyncio.sleep(60)
+
+
+class ReportSettingsIn(BaseModel):
+    weekly: Optional[bool] = None
+    monthly: Optional[bool] = None
+
+
+@app.get("/api/admin/report-settings")
+async def get_report_settings(a: dict = Depends(owner_user)):
+    r = ((await db.select("shop", {"id": "eq.1", "select": "weekly_report,monthly_report,report_error"})) or [{}])[0]
+    return {"weekly": bool(r.get("weekly_report")), "monthly": bool(r.get("monthly_report")), "error": r.get("report_error")}
+
+
+@app.put("/api/admin/report-settings")
+async def set_report_settings(body: ReportSettingsIn, a: dict = Depends(owner_user)):
+    cur = ((await db.select("shop", {"id": "eq.1", "select": "weekly_last,monthly_last"})) or [{}])[0]
+    now, data = datetime.now(TZ), {}
+    for kind, val in (("weekly", body.weekly), ("monthly", body.monthly)):
+        if val is None:
+            continue
+        data[f"{kind}_report"] = val
+        if val:
+            mark = enable_mark(kind, now, cur.get(f"{kind}_last"))
+            if mark:
+                data[f"{kind}_last"] = mark.isoformat()
+    if not data:
+        raise HTTPException(400, "O'zgartirish yo'q")
+    data["report_error"] = None
+    if not await db.update("shop", {"id": "eq.1"}, data):
+        raise HTTPException(404, "Do'kon topilmadi")
+    return await get_report_settings(a)
 
 
 # ---- services
