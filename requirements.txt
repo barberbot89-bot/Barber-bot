@@ -3,3 +3,5 @@ uvicorn>=0.29
 aiogram>=3.13,<4
 httpx>=0.27
 tzdata
+openpyxl
+reportlab
