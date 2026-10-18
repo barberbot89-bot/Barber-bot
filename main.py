@@ -22,6 +22,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     KeyboardButton,
     MenuButtonWebApp,
+    BufferedInputFile,
     CallbackQuery,
     Message,
     ReplyKeyboardMarkup,
@@ -1050,7 +1051,7 @@ def compute_analytics(rows, d1, d2, now, prior_clients, svc_map, group_month):
                 y, m = y + 1, 1
     else:
         keys = [(d1 + timedelta(days=i)).isoformat() for i in range((d2 - d1).days + 1)]
-    series = {k: {"k": k, "revenue": 0, "done": 0, "cancelled": 0} for k in keys}
+    series = {k: {"k": k, "revenue": 0, "done": 0, "cancelled": 0, "no_show": 0, "_c": set()} for k in keys}
     for r in rows:
         st = r["status"]
         counts[st] = counts.get(st, 0) + 1
@@ -1060,6 +1061,8 @@ def compute_analytics(rows, d1, d2, now, prior_clients, svc_map, group_month):
             elig[st] += 1
         if st == "cancelled" and b:
             b["cancelled"] += 1
+        if st == "no_show" and b:
+            b["no_show"] += 1
         if st != "done":
             continue
         price = r.get("total_price") or 0
@@ -1067,6 +1070,8 @@ def compute_analytics(rows, d1, d2, now, prior_clients, svc_map, group_month):
         if b:
             b["revenue"] += price
             b["done"] += 1
+            if r.get("client_id") is not None:
+                b["_c"].add(r["client_id"])
         ids = r.get("service_ids") or ([r["service_id"]] if r.get("service_id") else [])
         names = [svc_map[i] for i in ids if i in svc_map]
         if not names:  # eski yozuvlar: matndan
@@ -1082,7 +1087,7 @@ def compute_analytics(rows, d1, d2, now, prior_clients, svc_map, group_month):
     unique = len(visits)
     returning = sum(1 for c in visits if c in prior_clients)
     denom = sum(elig.values())
-    vals = list(series.values())
+    vals = [{**{k: v for k, v in x.items() if k != "_c"}, "unique": len(x["_c"])} for x in series.values()]
     best = max(vals, key=lambda x: x["done"], default=None)
     worst = max(vals, key=lambda x: x["cancelled"], default=None)
     top_raw = sorted(((c, v[0], v[1]) for c, v in visits.items() if v[0] >= 2), key=lambda x: (-x[1], -x[2]))[:5]
@@ -1106,9 +1111,7 @@ def compute_analytics(rows, d1, d2, now, prior_clients, svc_map, group_month):
     }
 
 
-@app.get("/api/admin/analytics")
-async def admin_analytics(start: str, end: str, prev_start: str = "", prev_end: str = "",
-                          branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
+def _parse_range(start, end, prev_start="", prev_end=""):
     try:
         d1, d2 = date.fromisoformat(start), date.fromisoformat(end)
         p1 = date.fromisoformat(prev_start) if prev_start and prev_end else None
@@ -1123,20 +1126,25 @@ async def admin_analytics(start: str, end: str, prev_start: str = "", prev_end: 
     if not p1:  # oldingi teng davr
         p2 = d1 - timedelta(days=1)
         p1 = p2 - timedelta(days=days - 1)
+    return d1, d2, p1, p2
 
+
+async def build_report(d1, d2, p1, p2, branch_id=0, barber_id=0, scope=None, daily=False):
+    """Dashboard va eksport uchun yagona hisob-kitob. Qaytaradi: (natija, bronlar qatorlari)."""
+    days = (d2 - d1).days + 1
     flt = []
     if branch_id:
         flt.append(("branch_id", f"eq.{branch_id}"))
     if barber_id:
         flt.append(("barber_id", f"eq.{barber_id}"))
-    if a["scope"] is not None:
-        flt.append(("barber_id", in_list(a["scope"])))
+    if scope is not None:
+        flt.append(("barber_id", in_list(scope)))
 
     lo, hi = datetime.combine(d1, dtime.min, TZ), datetime.combine(d2 + timedelta(days=1), dtime.min, TZ)
     plo, phi = datetime.combine(p1, dtime.min, TZ), datetime.combine(p2 + timedelta(days=1), dtime.min, TZ)
     rows = await select_all("bookings", [
         ("start_at", f"gte.{lo.isoformat()}"), ("start_at", f"lt.{hi.isoformat()}"),
-        ("select", "status,total_price,start_at,client_id,service_id,service_ids,svc_names")] + flt)
+        ("select", "status,total_price,start_at,client_id,service_id,service_ids,svc_names,barber_id,branch_id")] + flt)
     prev_rows = await select_all("bookings", [
         ("status", "eq.done"), ("start_at", f"gte.{plo.isoformat()}"), ("start_at", f"lt.{phi.isoformat()}"),
         ("select", "total_price")] + flt)
@@ -1147,15 +1155,15 @@ async def admin_analytics(start: str, end: str, prev_start: str = "", prev_end: 
     for i in range(0, len(done_clients), 100):
         pf = [("status", "eq.done"), ("start_at", f"lt.{lo.isoformat()}"),
               ("client_id", in_list(done_clients[i:i + 100])), ("select", "client_id")]
-        if a["scope"] is not None:
-            pf.append(("barber_id", in_list(a["scope"])))
+        if scope is not None:
+            pf.append(("barber_id", in_list(scope)))
         prior |= {x["client_id"] for x in await select_all("bookings", pf)}
 
     svc_map = {}
     if any(r["status"] == "done" for r in rows):
         svc_map = {x["id"]: x["name"] for x in await db.select("services", {"select": "id,name"})}
 
-    out = compute_analytics(rows, d1, d2, datetime.now(TZ), prior, svc_map, days > 62)
+    out = compute_analytics(rows, d1, d2, datetime.now(TZ), prior, svc_map, days > 62 and not daily)
     top_raw = out.pop("top_raw")
     names = {}
     if top_raw:
@@ -1167,7 +1175,283 @@ async def admin_analytics(start: str, end: str, prev_start: str = "", prev_end: 
                       "pct": _pct(diff, prev_rev) if prev_rev else None,
                       "prev_start": p1.isoformat(), "prev_end": p2.isoformat()}
     out["range"] = {"start": d1.isoformat(), "end": d2.isoformat(), "days": days}
+    return out, rows
+
+
+@app.get("/api/admin/analytics")
+async def admin_analytics(start: str, end: str, prev_start: str = "", prev_end: str = "",
+                          branch_id: int = 0, barber_id: int = 0, a: dict = Depends(staff_user)):
+    d1, d2, p1, p2 = _parse_range(start, end, prev_start, prev_end)
+    out, _ = await build_report(d1, d2, p1, p2, branch_id, barber_id, a["scope"])
     return out
+
+
+# ---- eksport (Excel / PDF): dashboard bilan bir xil hisob-kitob, fayl botdan Telegramga yuboriladi
+def compute_breakdowns(rows, barber_names, branch_names):
+    """Ustalar va filiallar bo'yicha bajarilgan vizitlar (sof hisob-kitob)."""
+    bb, br = {}, {}
+    for r in rows:
+        if r["status"] != "done":
+            continue
+        price = r.get("total_price") or 0
+        x = bb.setdefault(r.get("barber_id"), [0, 0])
+        x[0] += 1
+        x[1] += price
+        g = br.setdefault(r.get("branch_id"), {"done": 0, "revenue": 0, "c": set()})
+        g["done"] += 1
+        g["revenue"] += price
+        if r.get("client_id") is not None:
+            g["c"].add(r["client_id"])
+    by_barber = sorted(({"name": barber_names.get(k) or "—", "done": v[0], "revenue": v[1],
+                         "avg": round(v[1] / v[0]) if v[0] else None} for k, v in bb.items()),
+                       key=lambda x: -x["revenue"])
+    by_branch = sorted(({"name": branch_names.get(k) or "—", "done": v["done"], "revenue": v["revenue"],
+                         "unique": len(v["c"])} for k, v in br.items()), key=lambda x: -x["revenue"])
+    return by_barber, by_branch
+
+
+def _dmy(iso):
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[:4]}"
+
+
+def _money(n):
+    return f"{int(n):,}".replace(",", " ") + " so‘m"
+
+
+def _pc(p):
+    return "—" if p is None else f"{p}%"
+
+
+def make_xlsx(rep) -> bytes:
+    from io import BytesIO
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    o, cmp_ = rep["out"], rep["out"]["compare"]
+    SUM, PCT = '#,##0" so‘m"', '0.0"%"'
+    head_font, head_fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="14223A")
+
+    def table(ws, headers, data, fmts, row0=1):
+        for j, hd in enumerate(headers, 1):
+            c = ws.cell(row=row0, column=j, value=hd)
+            c.font, c.fill, c.alignment = head_font, head_fill, Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for i, rw in enumerate(data, row0 + 1):
+            for j, v in enumerate(rw, 1):
+                c = ws.cell(row=i, column=j, value=v)
+                if fmts[j - 1] and isinstance(v, (int, float)):
+                    c.number_format = fmts[j - 1]
+        for j, hd in enumerate(headers, 1):
+            w = max([len(str(hd))] + [len(str(rw[j - 1])) for rw in data]) + 3
+            ws.column_dimensions[get_column_letter(j)].width = min(max(w, 12), 40)
+        ws.freeze_panes = ws.cell(row=row0 + 1, column=1)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Xulosa"
+    ws["A1"] = "Hisobot"
+    ws["A1"].font = Font(bold=True, size=16)
+    cu, rt = o["customers"], o["rates"]
+    items = [
+        ("Davr", f"{_dmy(o['range']['start'])} – {_dmy(o['range']['end'])}", None),
+        ("Tayyorlangan vaqt", rep["generated"], None),
+        ("Filial", rep["branch_label"], None),
+        ("Usta", rep["barber_label"], None),
+        (None, None, None),
+        ("Jami tushum", o["revenue"], SUM),
+        ("Bajarilgan bronlar", o["counts"]["done"], "0"),
+        ("Kutilayotgan bronlar (tushumga kirmaydi)", o["upcoming"], "0"),
+        ("Bekor qilingan bronlar", o["counts"]["cancelled"], "0"),
+        ("Kelmagan bronlar", o["counts"]["no_show"], "0"),
+        ("O‘rtacha chek", o["avg_check"] if o["avg_check"] is not None else "—", SUM),
+        (None, None, None),
+        ("Kelgan mijozlar (noyob)", cu["unique"], "0"),
+        ("Yangi mijozlar", cu["new"], "0"),
+        ("Qaytgan mijozlar", cu["returning"], "0"),
+        ("Qaytganlar ulushi", cu["returning_rate"] if cu["returning_rate"] is not None else "—", PCT),
+        (None, None, None),
+        ("Bajarilish foizi", rt["completion"] if rt["completion"] is not None else "—", PCT),
+        ("Bekor qilish foizi", rt["cancelled"] if rt["cancelled"] is not None else "—", PCT),
+        ("Kelmaslik foizi", rt["no_show"] if rt["no_show"] is not None else "—", PCT),
+        ("Foizlar bazasi (o‘tgan, natijasi ma’lum bronlar)", rt["eligible"], "0"),
+        (None, None, None),
+        (f"Oldingi davr ({_dmy(cmp_['prev_start'])} – {_dmy(cmp_['prev_end'])}) tushumi", cmp_["previous"], SUM),
+        ("Farq", cmp_["diff"], SUM),
+        ("O‘zgarish", cmp_["pct"] if cmp_["pct"] is not None else "—", PCT),
+    ]
+    for i, (k, v, f) in enumerate(items, 3):
+        if k is None:
+            continue
+        ws.cell(row=i, column=1, value=k).font = Font(bold=True)
+        c = ws.cell(row=i, column=2, value=v)
+        c.alignment = Alignment(horizontal="left")
+        if f and isinstance(v, (int, float)):
+            c.number_format = f
+    ws.column_dimensions["A"].width = 52
+    ws.column_dimensions["B"].width = 30
+
+    table(wb.create_sheet("Kunlar"), ["Sana", "Tushum", "Bajarilgan", "Bekor", "Kelmagan", "Noyob mijozlar"],
+          [[_dmy(x["k"]), x["revenue"], x["done"], x["cancelled"], x["no_show"], x["unique"]] for x in o["series"]],
+          [None, SUM, "0", "0", "0", "0"])
+    table(wb.create_sheet("Ustalar"), ["Usta", "Bajarilgan", "Tushum", "O‘rtacha chek"],
+          [[x["name"], x["done"], x["revenue"], x["avg"] if x["avg"] is not None else "—"] for x in rep["by_barber"]] or [["Ma’lumot yo‘q", "", "", ""]],
+          [None, "0", SUM, SUM])
+    table(wb.create_sheet("Xizmatlar"), ["Xizmat", "Bajarilgan soni"],
+          [[x["name"], x["count"]] for x in o["by_service"]] or [["Ma’lumot yo‘q", ""]], [None, "0"])
+    if rep["show_branches"]:
+        table(wb.create_sheet("Filiallar"), ["Filial", "Bajarilgan", "Tushum", "Noyob mijozlar"],
+              [[x["name"], x["done"], x["revenue"], x["unique"]] for x in rep["by_branch"]] or [["Ma’lumot yo‘q", "", "", ""]],
+              [None, "0", SUM, "0"])
+    buf = BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+
+
+def _pdf_fonts():
+    """Unicode shrift (o‘, g‘, kirill). Topilmasa -- standart shrift va noma'lum belgilar '?' bo'ladi."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    for reg, bold in [(os.path.join(_FONT_DIR, "DejaVuSans.ttf"), os.path.join(_FONT_DIR, "DejaVuSans-Bold.ttf")),
+                      ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+                      ("/usr/share/fonts/dejavu/DejaVuSans.ttf", "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf")]:
+        if os.path.exists(reg) and os.path.exists(bold):
+            if "RptSans" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(TTFont("RptSans", reg))
+                pdfmetrics.registerFont(TTFont("RptSans-B", bold))
+            return "RptSans", "RptSans-B", True
+    return "Helvetica", "Helvetica-Bold", False
+
+
+def make_pdf(rep) -> bytes:
+    from io import BytesIO
+    from xml.sax.saxutils import escape
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    font, bold, uni = _pdf_fonts()
+    INK, BLUE, GREY = colors.HexColor("#14223A"), colors.HexColor("#1F4E9C"), colors.HexColor("#ECEFF3")
+
+    def tx(v):
+        v = str(v)
+        return escape(v if uni else v.encode("cp1252", "replace").decode("cp1252"))
+
+    st_n = ParagraphStyle("n", fontName=font, fontSize=9, leading=12, textColor=INK)
+    st_b = ParagraphStyle("b", parent=st_n, fontName=bold)
+    st_h = ParagraphStyle("h", fontName=bold, fontSize=12, leading=15, textColor=BLUE, spaceBefore=10, spaceAfter=4, keepWithNext=1)
+    st_t = ParagraphStyle("t", fontName=bold, fontSize=20, leading=24, textColor=INK)
+    st_m = ParagraphStyle("m", parent=st_n, textColor=colors.HexColor("#667489"))
+    st_hd = ParagraphStyle("hd", parent=st_n, fontName=bold, textColor=colors.white)
+    W = A4[0] - 30 * mm
+
+    def tbl(headers, data, widths, num_cols=()):
+        cell = lambda v, j, base: Paragraph(tx(v), ParagraphStyle("c", parent=base, alignment=2 if j in num_cols else 0))
+        body = [[cell(h, j, st_hd) for j, h in enumerate(headers)]] + [[cell(v, j, st_n) for j, v in enumerate(r)] for r in data]
+        t = Table(body, colWidths=[w * W for w in widths], repeatRows=1)
+        t.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, 0), INK), ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                               ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, GREY]),
+                               ("LINEBELOW", (0, 0), (-1, -1), 0.25, colors.HexColor("#DDE3EA")),
+                               ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4)]))
+        return t
+
+    o, c = rep["out"], rep["out"]["compare"]
+    cu, rt = o["customers"], o["rates"]
+    el = [Paragraph(tx("Hisobot"), st_t),
+          Paragraph(tx(f"{_dmy(o['range']['start'])} – {_dmy(o['range']['end'])}"), st_b),
+          Paragraph(tx(f"Filial: {rep['branch_label']}   ·   Usta: {rep['barber_label']}"), st_m),
+          Paragraph(tx(f"Tayyorlangan: {rep['generated']}"), st_m), Spacer(1, 6)]
+
+    el += [Paragraph(tx("Asosiy ko‘rsatkichlar"), st_h), tbl(["Ko‘rsatkich", "Qiymat"], [
+        ["Jami tushum", _money(o["revenue"])],
+        ["O‘rtacha chek", "—" if o["avg_check"] is None else _money(o["avg_check"])],
+        ["Bajarilgan bronlar", o["counts"]["done"]],
+        ["Kutilayotgan bronlar (tushumga kirmaydi)", o["upcoming"]],
+        ["Bekor qilingan bronlar", o["counts"]["cancelled"]],
+        ["Kelmagan bronlar", o["counts"]["no_show"]]], [0.62, 0.38], (1,))]
+
+    sign = "+" if c["diff"] > 0 else ("−" if c["diff"] < 0 else "")
+    el += [Paragraph(tx("Oldingi davr bilan taqqoslash"), st_h), tbl(["", "Qiymat"], [
+        [f"Oldingi davr ({_dmy(c['prev_start'])} – {_dmy(c['prev_end'])})", _money(c["previous"])],
+        ["Farq", sign + _money(abs(c["diff"]))],
+        ["O‘zgarish", "—" if c["pct"] is None else f"{'+' if c['pct'] > 0 else ('−' if c['pct'] < 0 else '')}{abs(c['pct'])}%"]],
+        [0.62, 0.38], (1,))]
+
+    el += [Paragraph(tx("Mijozlar"), st_h), tbl(["Ko‘rsatkich", "Qiymat"], [
+        ["Kelgan mijozlar (noyob)", cu["unique"]], ["Yangi mijozlar", cu["new"]],
+        ["Qaytgan mijozlar", cu["returning"]], ["Qaytganlar ulushi", _pc(cu["returning_rate"])]], [0.62, 0.38], (1,))]
+    if o["top_customers"]:
+        el += [Spacer(1, 4), tbl(["Eng ko‘p kelganlar", "Vizit", "Tushum"],
+                                 [[x["name"], x["visits"], _money(x["revenue"])] for x in o["top_customers"]], [0.5, 0.15, 0.35], (1, 2))]
+
+    el += [Paragraph(tx("Bronlar natijasi"), st_h), tbl(["Ko‘rsatkich", "Qiymat"], [
+        ["Bajarilish foizi", _pc(rt["completion"])], ["Bekor qilish foizi", _pc(rt["cancelled"])],
+        ["Kelmaslik foizi", _pc(rt["no_show"])]], [0.62, 0.38], (1,)),
+        Paragraph(tx(f"Foizlar faqat vaqti o‘tgan va natijasi ma’lum bronlardan hisoblangan ({rt['eligible']} ta)."), st_m)]
+
+    el += [Paragraph(tx("Kunlik statistika"), st_h), tbl(["Sana", "Tushum", "Bajarilgan", "Bekor", "Kelmagan", "Mijoz"],
+           [[_dmy(x["k"]), _money(x["revenue"]), x["done"], x["cancelled"], x["no_show"], x["unique"]] for x in o["series"]],
+           [0.17, 0.27, 0.16, 0.12, 0.15, 0.13], (1, 2, 3, 4, 5))]
+    if rep["by_barber"]:
+        el += [Paragraph(tx("Ustalar"), st_h), tbl(["Usta", "Bajarilgan", "Tushum", "O‘rtacha chek"],
+               [[x["name"], x["done"], _money(x["revenue"]), "—" if x["avg"] is None else _money(x["avg"])] for x in rep["by_barber"]],
+               [0.3, 0.16, 0.27, 0.27], (1, 2, 3))]
+    if o["by_service"]:
+        el += [Paragraph(tx("Xizmatlar"), st_h), tbl(["Xizmat", "Bajarilgan soni"],
+               [[x["name"], x["count"]] for x in o["by_service"]], [0.7, 0.3], (1,))]
+    if rep["show_branches"] and rep["by_branch"]:
+        el += [Paragraph(tx("Filiallar"), st_h), tbl(["Filial", "Bajarilgan", "Tushum", "Mijoz"],
+               [[x["name"], x["done"], _money(x["revenue"]), x["unique"]] for x in rep["by_branch"]],
+               [0.34, 0.16, 0.32, 0.18], (1, 2, 3))]
+
+    def footer(canvas, doc):
+        canvas.saveState()
+        canvas.setFont(font, 8)
+        canvas.setFillColor(colors.HexColor("#667489"))
+        canvas.drawRightString(A4[0] - 15 * mm, 10 * mm, tx(f"Sahifa {doc.page}"))
+        canvas.restoreState()
+
+    buf = BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4, leftMargin=15 * mm, rightMargin=15 * mm, topMargin=14 * mm, bottomMargin=16 * mm,
+                      title="Hisobot").build(el, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+_export_last: dict = {}
+
+
+@app.post("/api/admin/export")
+async def admin_export(fmt: str, start: str, end: str, branch_id: int = 0, barber_id: int = 0, a: dict = Depends(admin_user)):
+    if fmt not in ("xlsx", "pdf"):
+        raise HTTPException(400, "Format noto'g'ri")
+    d1, d2, p1, p2 = _parse_range(start, end)
+    now_m = _time.monotonic()
+    if now_m - _export_last.get(a["telegram_id"], -99.0) < 8:
+        raise HTTPException(429, "Biroz kuting, oldingi fayl tayyorlanmoqda")
+    _export_last[a["telegram_id"]] = now_m
+    out, rows = await build_report(d1, d2, p1, p2, branch_id, barber_id, None, daily=True)
+    branches = {x["id"]: x["name"] for x in await db.select("branches", {"select": "id,name"})}
+    barbers = {x["id"]: x["name"] for x in await db.select("barbers", {"select": "id,name"})}
+    by_barber, by_branch = compute_breakdowns(rows, barbers, branches)
+    data = {
+        "out": out, "by_barber": by_barber, "by_branch": by_branch, "show_branches": not branch_id,
+        "branch_label": branches.get(branch_id, "—") if branch_id else "Hammasi",
+        "barber_label": barbers.get(barber_id, "—") if barber_id else "Hammasi",
+        "generated": datetime.now(TZ).strftime("%d.%m.%Y %H:%M"),
+    }
+    blob = await asyncio.to_thread(make_xlsx if fmt == "xlsx" else make_pdf, data)
+    fname = f"hisobot_{d1.isoformat()}_{d2.isoformat()}.{fmt}"
+    try:
+        await bot.send_document(a["telegram_id"], BufferedInputFile(blob, filename=fname),
+                                caption=f"Hisobot: {_dmy(d1.isoformat())} – {_dmy(d2.isoformat())}")
+    except Exception:
+        log.exception("eksport yuborilmadi")
+        raise HTTPException(502, "Faylni Telegramga yuborib bo'lmadi. Botni ishga tushirganingizni tekshiring.")
+    return {"ok": True}
 
 
 # ---- services
